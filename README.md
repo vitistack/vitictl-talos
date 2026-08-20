@@ -379,6 +379,96 @@ the version tag into it. Every resolved image is printed before anything runs:
 `--image` overrides that outright. Matching the schematic and the platform is
 then yours to get right.
 
+### Changing the image — all four parts, or the whole thing
+
+An Image Factory reference has four independently editable parts. Anything you
+do not name is carried over from the node:
+
+```
+<registry>          / <platform>-installer / <schematic> : <version>
+--registry            --platform             --schematic   --to
+```
+
+| Flag | Changes | Why you would |
+| ---- | ------- | ------------- |
+| `--registry` | Where the image is pulled from | A local mirror, an air-gapped copy |
+| `--platform` | Which platform variant | The cluster moved provider — `metal` → `hcloud` |
+| `--schematic` | System extensions and kernel arguments | Adding or dropping extensions |
+| `--to` | The Talos release | An upgrade |
+| `--image` | The whole reference | When the parts are not what you want to think in |
+
+They combine, so a provider move, an extension change and a version bump are
+one rolling pass rather than three:
+
+```sh
+viti talos upgrade-node my-cluster --platform hcloud --schematic <id> --to v1.13.9 --dry-run
+```
+
+Only `--to` works on any reference. The other three are *positional* parts of a
+factory reference, so they need one — a plain `ghcr.io/siderolabs/installer` is
+refused rather than rewritten, since rewriting one of its segments would
+produce an image that does not exist and fail as a pull error mid-rollout.
+
+#### `--platform` is the sharp one
+
+The platform baked into the installer decides where Talos reads its machine
+config and network settings on the next boot. A wrong one **does not fail
+loudly** — the node comes back up `Ready` with its config source silently gone.
+
+So each node's actually-running platform is read from its own
+`PlatformMetadata` and shown against the target:
+
+```
+   • cephtest-036-ab36-ctp0   controlplane   declared v1.13.6 → factory.talos.dev/hcloud-installer/b0f2…9365:v1.13.9
+   ⚠️  platform: nodes report nocloud, installer targets hcloud
+       The platform decides where Talos reads its config and network settings on the next
+       boot. A wrong one does not fail loudly — the node comes back Ready with its config
+       source gone. Make sure this matches where the cluster actually runs.
+```
+
+A mismatch is *expected* when this is the change you intend — a node
+provisioned from a metal installer reports `metal` even when it is a Hetzner
+VM, and that is the reason to switch. It is shown so the switch is deliberate.
+
+#### Getting a schematic id
+
+Build the new schematic at the factory first — what you pass is the id it
+returns, not a file:
+
+```sh
+curl -X POST --data-binary @schematic.yaml https://factory.talos.dev/schematics
+# {"id":"<64 hex characters>"}
+
+viti talos upgrade-node my-cluster --schematic <id> --dry-run   # extensions only
+viti talos upgrade-node my-cluster --schematic <id> --to v1.13.9   # and a version bump
+```
+
+**Any of these also update the cluster's pinned `install_image`**, in the credentials
+Secret, before any node is touched:
+
+```
+   • cephtest-036-ab36-ctp0   controlplane   declared v1.13.6 → factory.talos.dev/nocloud-installer/1111…1111:v1.13.9
+   pin:    install_image factory.talos.dev/nocloud-installer/b0f2…9365:v1.13.2 → factory.talos.dev/nocloud-installer/1111…1111:v1.13.9
+```
+
+That pin is the talos-operator's desired state and it **wins over what the
+nodes report** — its resolution order is the pin first, a live-fetch from a
+running control plane second, a provider default last. Change the image on the
+nodes without changing the pin and the operator's next version enforcement
+resolves from the old pin, swaps only the version tag, and puts the old
+schematic back. Recording the intent first also means an upgrade interrupted
+halfway leaves the operator finishing the job rather than undoing it.
+
+`--no-pin` opts out and says so:
+
+```
+   ⚠️  install_image stays factory.talos.dev/…:v1.13.2 (--no-pin) — the operator will revert this
+```
+
+If the targeted nodes would end up on different images, there is no single
+image to pin and the command refuses rather than picking one — pinning one of
+several would quietly converge the rest onto it.
+
 Note that the talos-operator also enforces a cluster's Talos version. Running
 `upgrade-node` by hand is for the cases it cannot resolve.
 

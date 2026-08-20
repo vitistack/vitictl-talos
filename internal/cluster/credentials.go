@@ -178,3 +178,48 @@ func sourceContext(cfg *talosConfig) *talosCtxEntry {
 	}
 	return cfg.Contexts[name]
 }
+
+// KeyInstallImage is the Secret entry holding the cluster's pinned Talos
+// installer image.
+//
+// It is the desired state the talos-operator upgrades from: its resolution
+// order is this pinned value first, a live-fetch from a running control plane
+// second, and a provider default last. Changing a node's installer image
+// without changing this therefore does not stick — the operator's next version
+// enforcement resolves from the pin, swaps only the version tag, and puts the
+// old schematic back.
+const KeyInstallImage = "install_image" // #nosec G101 -- a Secret key name, not a credential
+
+// PinnedInstallImage returns the installer image pinned in the cluster's
+// credentials Secret, or "" when none is set.
+func PinnedInstallImage(ctx context.Context, c Cluster) (string, error) {
+	secret, err := FindSecret(ctx, c)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(secret.Data[KeyInstallImage])), nil
+}
+
+// PinInstallImage writes image into the cluster's credentials Secret, making it
+// the installer the operator will drive future upgrades from.
+//
+// This is written before the nodes are touched, not after. The operator's job
+// is to converge on desired state, so recording the intent first makes it an
+// ally: an upgrade interrupted halfway leaves the operator finishing the rest
+// rather than undoing what was done.
+func PinInstallImage(ctx context.Context, c Cluster, image string) error {
+	secret, err := FindSecret(ctx, c)
+	if err != nil {
+		return err
+	}
+	patched := secret.DeepCopy()
+	if patched.Data == nil {
+		patched.Data = map[string][]byte{}
+	}
+	patched.Data[KeyInstallImage] = []byte(image)
+	if err := c.AZ.Ctrl.Update(ctx, patched); err != nil {
+		return fmt.Errorf("pinning install image in secret %s/%s: %w",
+			secret.Namespace, secret.Name, err)
+	}
+	return nil
+}

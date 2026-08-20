@@ -117,23 +117,39 @@ func Run(ctx context.Context, s Streams, t Target, verb string, extra ...string)
 // block printed on completion is both readable and attributable. The output is
 // returned even when the command fails — a talosctl error message is the most
 // useful thing a failed target can report.
+//
+// Merging the streams is right for output meant to be read and wrong for
+// output meant to be parsed; see CaptureStreams.
 func Capture(ctx context.Context, t Target, verb string, extra ...string) (string, error) {
+	stdout, stderr, err := CaptureStreams(ctx, t, verb, extra...)
+	return stdout + stderr, err
+}
+
+// CaptureStreams executes talosctl and returns stdout and stderr separately.
+//
+// Anything that parses talosctl's output must use this rather than Capture.
+// talosctl writes advisories to stderr — "WARNING: 10.0.0.1: server version
+// 1.13.2 is older than client version 1.13.9" is emitted on every call to a
+// node running an older Talos — and that line is not valid YAML. Merged into
+// the document it silently defeats the parser, which then reports the field as
+// missing from a config that plainly contains it.
+func CaptureStreams(ctx context.Context, t Target, verb string, extra ...string) (stdout, stderr string, err error) {
 	argv, err := build(t, verb, extra...)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	bin, err := Path()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	var buf bytes.Buffer
+	var outBuf, errBuf bytes.Buffer
 	// #nosec G204 -- see Run.
 	c := exec.CommandContext(ctx, bin, argv...)
-	c.Stdout = &buf
-	c.Stderr = &buf
+	c.Stdout = &outBuf
+	c.Stderr = &errBuf
 	c.Env = os.Environ()
 	err = c.Run()
-	return buf.String(), err
+	return outBuf.String(), errBuf.String(), err
 }
 
 // build assembles the full argument list. Split out so tests can assert on it

@@ -297,3 +297,20 @@ func TestGlueHintFiresOnlyOnAGluedCommandLine(t *testing.T) {
 		t.Errorf("hint does not point at the fix: %q", got)
 	}
 }
+
+// The pin is the operator's desired state; pinning one of several images would
+// quietly converge the rest onto it.
+func TestPinNeededOnlyWhenItWouldChangeSomething(t *testing.T) {
+	if (pin{have: "a", want: "a"}).needed() {
+		t.Error("pin reported needed when it already matches")
+	}
+	if !(pin{have: "a", want: "b"}).needed() {
+		t.Error("pin not reported needed when it differs")
+	}
+	if (pin{have: "a", want: "b", skipped: true}).needed() {
+		t.Error("--no-pin still wrote the pin")
+	}
+	if (pin{have: "a", want: ""}).needed() {
+		t.Error("pin reported needed with no target image")
+	}
+}
