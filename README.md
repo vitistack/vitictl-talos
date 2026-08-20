@@ -244,19 +244,36 @@ unless the ConfigMap is changed too.
 re-touches a node that is already done, so every rung is the *same command*,
 just less narrow.
 
+Define the unchanging half once, as a shell **function** — the arguments
+contain spaces and quotes, so a `P="..."` variable does not survive expansion
+in either bash or zsh:
+
 ```sh
-P="-p @drop-dhcp.yaml --if-match 'kind: DHCPv4Config' --mode no-reboot"
-
-viti talos patch -c my-cluster -N my-cluster-wrk0 $P --dry-run   # one machine
-viti talos patch -c my-cluster -N my-cluster-wrk0 $P --yes       # …for real
-
-viti talos patch -c my-cluster --role worker       $P --yes      # rest of the workers
-viti talos patch -c my-cluster --role controlplane $P --yes      # then the control planes
-viti talos patch -c my-cluster                     $P --yes      # whole cluster; done nodes skipped
-
-viti talos -z my-zone patch --all $P --dry-run                   # one availability zone
-viti talos patch --all            $P --dry-run                   # the fleet
+drop() { viti talos patch -p @drop-dhcp.yaml --if-match 'kind: DHCPv4Config' --mode no-reboot "$@"; }
 ```
+
+Then climb, widening the scope one rung at a time:
+
+```sh
+drop -c my-cluster -N my-cluster-wrk0 --dry-run   # one machine
+drop -c my-cluster -N my-cluster-wrk0 --yes       # …for real
+
+drop -c my-cluster --role worker       --yes      # rest of the workers
+drop -c my-cluster --role controlplane --yes      # then the control planes
+drop -c my-cluster                     --yes      # whole cluster; done nodes skipped
+
+drop --all --dry-run                              # the fleet
+```
+
+Scoping `--all` to one availability zone takes viti's own `-z`, which belongs
+to `viti` rather than to the plugin, so it goes before the subcommand:
+
+```sh
+viti talos -z my-zone patch --all -p @drop-dhcp.yaml --if-match 'kind: DHCPv4Config' --mode no-reboot --dry-run
+```
+
+Substitute your own cluster for `my-cluster` — a placeholder left in place
+fails at cluster resolution, after the patch file has already been read.
 
 Check a rung landed before climbing:
 

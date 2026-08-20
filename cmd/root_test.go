@@ -14,7 +14,7 @@ import (
 func TestRootCommandTree(t *testing.T) {
 	root := NewRootCmd()
 	want := []string{
-		"clusters", "nodes", "dashboard", "dmesg", "netstat", "memory",
+		"clusters", "nodes", "dashboard", "dmesg", "netstat", "memory", "get",
 		"edit", "show", "patch", "upgrade-node", "upgrade-k8s",
 		"config", "version", "upgrade",
 	}
@@ -277,5 +277,23 @@ func TestNothingToDoIsSuccessButNotAttemptedIsNot(t *testing.T) {
 	// A cluster that matched and then failed is still a failure.
 	if (clusterResult{NoMatch: false, Steps: []nodeResult{{Error: "boom"}}}).OK() {
 		t.Error("a failed cluster reported OK")
+	}
+}
+
+// A flags-in-a-variable mistake arrives as a filename containing a command
+// line. Diagnosing it beats sending the reader to look at their filesystem.
+func TestGlueHintFiresOnlyOnAGluedCommandLine(t *testing.T) {
+	if got := glueHint("patch.yaml"); got != "" {
+		t.Errorf("glueHint() fired on an ordinary missing file: %q", got)
+	}
+	if got := glueHint("my-patches/net-0.yaml"); got != "" {
+		t.Errorf("glueHint() fired on a path containing a dash: %q", got)
+	}
+	got := glueHint("drop.yaml --if-match 'kind: DHCPv4Config' --mode no-reboot")
+	if got == "" {
+		t.Fatal("glueHint() did not recognise a glued command line")
+	}
+	if !strings.Contains(got, "function") {
+		t.Errorf("hint does not point at the fix: %q", got)
 	}
 }

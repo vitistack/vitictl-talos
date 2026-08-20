@@ -26,7 +26,7 @@ against it. No "viti kc login" first, and nothing written to your
 ~/.talos/config — a command that spans ten clusters must not leave your
 talosctl pointing at whichever one ran last.
 
-Single-cluster commands (dmesg, netstat, memory, dashboard, edit) take a
+Single-cluster commands (dmesg, netstat, memory, get, dashboard, edit) take a
 cluster name, or open an interactive fuzzy-searchable picker when you leave it
 out. The fleet command — patch — takes many, and its picker marks them.
 

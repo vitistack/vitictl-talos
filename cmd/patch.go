@@ -702,6 +702,9 @@ func patchFlags(patches []string) ([]string, error) {
 			path := strings.TrimPrefix(p, "@")
 			info, err := os.Stat(path)
 			if err != nil {
+				if hint := glueHint(path); hint != "" {
+					return nil, fmt.Errorf("patch file %q is not readable — %s", path, hint)
+				}
 				return nil, fmt.Errorf("patch file %q is not readable: %w", path, err)
 			}
 			if info.IsDir() {
@@ -714,6 +717,28 @@ func patchFlags(patches []string) ([]string, error) {
 		out = append(out, "-p", p)
 	}
 	return out, nil
+}
+
+// glueHint recognises a whole command line that arrived as one flag value and
+// explains it, returning "" for an ordinary missing file.
+//
+// It catches a specific and easily-made mistake: collecting the fixed flags in
+// a variable — P="-p @patch.yaml --mode staged" — and passing $P unquoted.
+// Neither shell does what that looks like. zsh does not word-split an
+// unquoted expansion at all, so the whole string arrives as one token and the
+// -p shorthand swallows the rest of it as its value; bash does split, but on
+// every space, which tears an embedded 'kind: X' argument in half. The
+// resulting error otherwise reads as a missing file with an absurd name,
+// which sends the reader looking at their filesystem rather than their shell.
+func glueHint(path string) string {
+	if !strings.Contains(path, " -") {
+		return ""
+	}
+	return "that is a whole command line, not a filename. A shell variable of " +
+		"flags does not survive expansion in bash or zsh; put the fixed flags in a " +
+		"function instead:\n" +
+		"  drop() { viti talos patch -p @patch.yaml --mode staged \"$@\"; }\n" +
+		"  drop -c my-cluster --dry-run"
 }
 
 func countNodes(sessions []planned) int {

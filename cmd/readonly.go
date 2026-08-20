@@ -55,6 +55,29 @@ what".`,
   viti talos netstat my-cluster -N my-cluster-ctp0 -- --listening --programs`,
 		},
 		{
+			name:    "get",
+			verb:    "get",
+			aliases: []string{"resource", "resources"},
+			short:   "🔧 Read any Talos resource from a cluster's nodes",
+			long: `Read any Talos resource, the way "talosctl get" does.
+
+This is the general form of "show", which is just "get machineconfig". Name
+the resource after a -- , since it is talosctl's argument rather than this
+command's:
+
+  viti talos get my-cluster -- operatorspecs -o yaml
+  viti talos get my-cluster -- links
+  viti talos get my-cluster -- addresses
+
+It is the way to check what a config change actually did to the running
+system, as opposed to what it did to the config text — "talosctl get
+operatorspecs" shows the DHCP client Talos ended up configuring, for
+instance, which a config diff cannot tell you.`,
+			example: `  viti talos get my-cluster -- operatorspecs -o yaml
+  viti talos get my-cluster -N my-cluster-wrk0 -- links
+  viti talos get my-cluster --role controlplane -- services`,
+		},
+		{
 			name:    "memory",
 			verb:    "memory",
 			aliases: []string{"mem"},
