@@ -12,7 +12,7 @@ import (
 	"github.com/vitistack/vitictl-talos/internal/cluster"
 	"github.com/vitistack/vitictl-talos/internal/config"
 	"github.com/vitistack/vitictl-talos/internal/kube"
-	"github.com/vitistack/vitictl-talos/internal/picker"
+	"github.com/vitistack/vitictl/pkg/plugin/picker"
 )
 
 // scope holds the flags every command shares: what to look at, and how to

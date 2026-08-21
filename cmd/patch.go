@@ -13,8 +13,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/vitistack/vitictl-talos/internal/cluster"
-	"github.com/vitistack/vitictl-talos/internal/output"
 	"github.com/vitistack/vitictl-talos/internal/talosctl"
+	"github.com/vitistack/vitictl/pkg/plugin/output"
 )
 
 // patchOptions is the fleet patch's full configuration, kept together so the
