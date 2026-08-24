@@ -373,8 +373,61 @@ the version tag into it. Every resolved image is printed before anything runs:
 ```
 ⬆️  Upgrading 3 node(s) of test-south-az1/cephtest5/cephtest-036, one at a time
    effect: each node reboots into the new version as it is upgraded
-   • cephtest-036-ab36-ctp0     controlplane   declared v1.13.6 → factory.talos.dev/nocloud-installer/b0f2…:v1.13.9
+   image:  factory.talos.dev/nocloud-installer/b0f2…9365
+   • cephtest-036-ab36-ctp0     controlplane   v1.13.6 → v1.13.9
+   • cephtest-036-ab36-wrk0     worker         v1.13.6 → v1.13.9
+   • cephtest-036-ab36-wrk1     worker         v1.13.6 → v1.13.9
+   pin:    install_image v1.13.6 → v1.13.9
 ```
+
+When every node moves within one installer lineage, which is what a `--to` bump
+does, the reference is printed once and the rows carry only the part that
+changes. Nodes on different lineages, or a change to more than the version,
+print the full reference on both sides instead.
+
+### Three versions disagree, and only one is real
+
+A Talos cluster reports its version from three places:
+
+| Source | What it is |
+| ------ | ---------- |
+| `Machine spec.os.imageID` | **Declared.** The operator bumps it to the newest *available* image ahead of any upgrade — observed 112 days ahead of reality |
+| `machine.install.image` on the node | **Installed.** What the config says to install, reconciled from the cluster's pinned `install_image` — which this command moves *before* touching a node |
+| `Node status.nodeInfo.osImage` in the guest cluster | **Running.** `Talos (v1.13.7)`, what the kubelet reports. The only one that is not a wish |
+
+The plan reads the third. It comes from the guest cluster's own Node objects,
+reached with the `kube.config` already in the same Secret the talosconfig is
+minted from — one API call, no Talos round trip, no second credential. The
+column says so, because a column that silently mixes the three reads as fact:
+
+```
+   current: what each node runs now, from the guest cluster's own Node objects
+   • d-stackops-1010-qjxq-ctp0    controlplane     v1.13.7 → v1.13.9
+```
+
+Whichever of the other two disagrees is named rather than left to stand in for
+reality — a fleet declaring v1.13.9 while running v1.13.7 makes an upgrade to
+v1.13.8 read as a *downgrade*:
+
+```
+   note:   nodes run v1.13.7, but machines declare v1.13.9 in spec.os.imageID.
+           Desired state runs ahead of the nodes; the rows above show what the nodes actually run.
+```
+
+The read is best-effort: upgrading a cluster whose Kubernetes API is unreachable
+is a large part of why this command exists, so a guest cluster that cannot be
+reached weakens the column instead of blocking the run. It falls back to the
+operator-verified `TalosVersionEnforcement` condition — free, on the CR already
+in hand, but cluster-wide, so it only speaks when every node agrees — and then
+to the installed version, each time saying which:
+
+```
+   current: what each node runs now, except 1 of 4 falling back to desired state
+   current: desired state for all 4 — no running version could be read
+```
+
+This is the same distinction `viti kc list` draws with its `~` prefix:
+`~1.13.9` means *unverified — machine image target only, runtime unknown*.
 
 `--image` overrides that outright. Matching the schematic and the platform is
 then yours to get right.
@@ -419,7 +472,9 @@ So each node's actually-running platform is read from its own
 `PlatformMetadata` and shown against the target:
 
 ```
-   • cephtest-036-ab36-ctp0   controlplane   declared v1.13.6 → factory.talos.dev/hcloud-installer/b0f2…9365:v1.13.9
+   • cephtest-036-ab36-ctp0   controlplane
+       from  factory.talos.dev/nocloud-installer/b0f2…9365:v1.13.6
+       to    factory.talos.dev/hcloud-installer/b0f2…9365:v1.13.9
    ⚠️  platform: nodes report nocloud, installer targets hcloud
        The platform decides where Talos reads its config and network settings on the next
        boot. A wrong one does not fail loudly — the node comes back Ready with its config
@@ -447,7 +502,9 @@ viti talos upgrade-node my-cluster --schematic <id> --to v1.13.9   # and a versi
 Secret, before any node is touched:
 
 ```
-   • cephtest-036-ab36-ctp0   controlplane   declared v1.13.6 → factory.talos.dev/nocloud-installer/1111…1111:v1.13.9
+   • cephtest-036-ab36-ctp0   controlplane
+       from  factory.talos.dev/nocloud-installer/b0f2…9365:v1.13.6
+       to    factory.talos.dev/nocloud-installer/1111…1111:v1.13.9
    pin:    install_image factory.talos.dev/nocloud-installer/b0f2…9365:v1.13.2 → factory.talos.dev/nocloud-installer/1111…1111:v1.13.9
 ```
 
@@ -471,6 +528,41 @@ several would quietly converge the rest onto it.
 
 Note that the talos-operator also enforces a cluster's Talos version. Running
 `upgrade-node` by hand is for the cases it cannot resolve.
+
+### When a node fails mid-roll
+
+Nodes are upgraded one at a time, so a failure stops the run with some nodes
+done and the rest untouched. Two consequences of that are easy to miss, so both
+are reported rather than left to be discovered:
+
+```
+❌ cephtest-036-ab36-wrk1 was not upgraded — 3 of 5 node(s) are done.
+   cephtest-036-ab36-wrk1 may be left cordoned. The upgrade cordons and drains a node before rebooting it
+   and uncordons it only once the upgrade succeeds, so check it before anything else:
+     kubectl get node cephtest-036-ab36-wrk1
+     kubectl uncordon cephtest-036-ab36-wrk1   # only if it is SchedulingDisabled and not coming back
+   install_image is already pinned to the target, so resuming changes nothing about the
+   operator's desired state:
+     factory.talos.dev/nocloud-installer/b0f2…9365:v1.13.9
+   Resume on the 2 node(s) left rather than re-running the cluster, which would reboot the
+   3 that are done:
+     viti talos upgrade-node cephtest-036 -N cephtest-036-ab36-wrk1 -N cephtest-036-ab36-wrk2 --to=v1.13.9
+```
+
+`talosctl` cordons and drains a node before rebooting it and uncordons it only
+once the upgrade succeeds, so a failed node is left `SchedulingDisabled` — a
+worker the cluster will not schedule onto, with nothing else on screen saying
+so. The warning is omitted under `--stage` and `--no-drain`, where nothing was
+drained in the first place.
+
+The resume command is rebuilt from the flags the run was actually given, so it
+carries `--stage`, `--schematic`, `--endpoint` and the rest; only `--node` is
+replaced, with the nodes that are left. It names itself the way you reached it
+— `viti talos`, or `viti t` through the alias — falling back to `viti-talos`
+when the binary is installed standalone with no `viti` beside it to dispatch
+through. Re-running the whole cluster also works
+— the pin already holds the target, so nothing fights the operator — but it
+reboots every node that already succeeded.
 
 `upgrade-k8s` is deliberately one cluster at a time: `talosctl` drives the
 whole upgrade from one control-plane node — API server, controller manager,

@@ -187,18 +187,36 @@ func splitYAMLDocuments(raw string) []string {
 	return append(docs, strings.Join(current, "\n"))
 }
 
-// SwapImageTag returns ref with its tag replaced by tag, appending one when
-// ref carries none.
+// SplitImageTag splits an image reference into everything before its tag and
+// the tag itself, which is "" when the reference carries none.
 //
-// The search is anchored after the last "/" so a registry port —
+// The split is anchored after the last "/" so a registry port —
 // "localhost:5000/installer" — is not mistaken for a tag separator.
-func SwapImageTag(ref, tag string) string {
+func SplitImageTag(ref string) (base, tag string) {
 	slash := strings.LastIndexByte(ref, '/')
 	colon := strings.LastIndexByte(ref, ':')
 	if colon > slash {
-		return ref[:colon] + ":" + tag
+		return ref[:colon], ref[colon+1:]
 	}
-	return ref + ":" + tag
+	return ref, ""
+}
+
+// TagOf returns the tag an image reference carries, or "" when it has none.
+//
+// It exists so a plan can show the part of a reference that is actually
+// changing. An installer reference is around a hundred characters of registry,
+// platform and schematic digest, and printed in full on both sides of an arrow
+// the version is the hardest thing on the line to find.
+func TagOf(ref string) string {
+	_, tag := SplitImageTag(ref)
+	return tag
+}
+
+// SwapImageTag returns ref with its tag replaced by tag, appending one when
+// ref carries none.
+func SwapImageTag(ref, tag string) string {
+	base, _ := SplitImageTag(ref)
+	return base + ":" + tag
 }
 
 // schematicPattern matches an Image Factory schematic digest: the 64-character

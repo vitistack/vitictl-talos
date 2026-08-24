@@ -314,3 +314,69 @@ func TestPinNeededOnlyWhenItWouldChangeSomething(t *testing.T) {
 		t.Error("pin reported needed with no target image")
 	}
 }
+
+// The resume command this tool prints is meant to be pasted, so it has to name
+// itself the way its user reaches it — "viti talos", which is what every
+// Example block and the whole README say — while still naming itself runnably
+// when there is no viti to reach it through.
+func TestInvocationName(t *testing.T) {
+	const path, root = "viti-talos upgrade-node", "viti-talos"
+
+	for _, tc := range []struct {
+		name       string
+		argv0      string
+		vitiOnPath bool
+		want       string
+	}{{
+		name:       "dispatched through viti",
+		argv0:      "/Users/x/.local/bin/viti-talos",
+		vitiOnPath: true,
+		want:       "viti talos upgrade-node",
+	}, {
+		// The alias is its own symlink, so a user who typed the shorthand gets
+		// the shorthand back rather than having it spelled out for them.
+		name:       "dispatched through the viti-t alias",
+		argv0:      "/Users/x/.local/bin/viti-t",
+		vitiOnPath: true,
+		want:       "viti t upgrade-node",
+	}, {
+		// The one case where inferring would hand over a command that does not
+		// run: standalone, with no vitictl installed beside it.
+		name:       "standalone with no viti on PATH",
+		argv0:      "/Users/x/.local/bin/viti-talos",
+		vitiOnPath: false,
+		want:       "viti-talos upgrade-node",
+	}, {
+		name:       "renamed binary",
+		argv0:      "/Users/x/bin/talos-tool",
+		vitiOnPath: true,
+		want:       "viti-talos upgrade-node",
+	}, {
+		name:       "windows",
+		argv0:      `C:\Users\x\bin\viti-talos.exe`,
+		vitiOnPath: true,
+		want:       "viti talos upgrade-node",
+	}, {
+		// The test binary's own argv0, which is why every other test in this
+		// package sees cobra's spelling and not the inferred one.
+		name:       "a test binary",
+		argv0:      "/tmp/go-build123/b001/cmd.test",
+		vitiOnPath: true,
+		want:       "viti-talos upgrade-node",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := invocationName(tc.argv0, path, root, tc.vitiOnPath); got != tc.want {
+				t.Errorf("invocationName(%q, viti on PATH=%v) = %q, want %q",
+					tc.argv0, tc.vitiOnPath, got, tc.want)
+			}
+		})
+	}
+}
+
+// Naming the root itself must not repeat the name it just derived.
+func TestInvocationNameOfTheRootCommand(t *testing.T) {
+	got := invocationName("/usr/bin/viti-talos", "viti-talos", "viti-talos", true)
+	if got != "viti talos" {
+		t.Errorf("invocationName of the root = %q, want %q", got, "viti talos")
+	}
+}
