@@ -27,6 +27,7 @@ func newUpgradeNodeCmd(s *scope) *cobra.Command {
 		registry  string
 		noPin     bool
 		force     bool
+		anyJump   bool
 	)
 
 	cmd := &cobra.Command{
@@ -122,6 +123,18 @@ targeted node is upgraded and the plan says so. --force does the same on
 demand, for reinstalling over a node that reports the right version but is not
 behaving like it.
 
+A transition Talos does not support is refused before anything is written.
+Talos upgrades one minor version at a time and does not go backwards, and
+neither rule is visible in an installer reference — a downgrade and a
+three-minor jump render exactly like the patch bump beside them. The comparison
+is against what each node runs, so a fleet whose declared version has run ahead
+of it does not have a legitimate upgrade refused as a downgrade.
+--allow-unsupported-version proceeds anyway.
+
+A version that cannot be read is never a refusal. A cluster whose running
+version is unavailable is one of the clusters this command exists to rescue, so
+the check reports that it could not run rather than blocking the run.
+
 Note that the talos-operator also enforces a cluster's Talos version. Running
 this by hand is for the cases the operator cannot resolve — an upgrade that
 needs stepping by hand, or a node it has given up on.`,
@@ -194,6 +207,14 @@ needs stepping by hand, or a node it has given up on.`,
 					"🔎 dry run — nothing was upgraded and nothing was pinned. Every image above was "+
 						"derived from that node's own machine.install.image.")
 				return nil
+			}
+
+			// Before the pin moves, not after: the pin is written ahead of any
+			// node precisely so an interrupted run is finished rather than
+			// undone, which means a pin recording a version Talos will not
+			// upgrade to would have the operator keep trying to reach it.
+			if err := refuseUnsupportedVersions(plan, anyJump); err != nil {
+				return err
 			}
 
 			// Nothing to do is a success, and it is still worth reconciling the
@@ -287,6 +308,8 @@ needs stepping by hand, or a node it has given up on.`,
 		"skip cordoning and draining the Kubernetes node before rebooting it")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false,
 		"resolve and print the per-node installer images, then stop without upgrading")
+	cmd.Flags().BoolVar(&anyJump, "allow-unsupported-version", false,
+		"proceed with a transition Talos does not support: a downgrade, or skipping a minor version")
 	cmd.Flags().BoolVar(&force, "force", false,
 		"upgrade every targeted node, including any already running the target image")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip the confirmation prompt")
@@ -310,6 +333,10 @@ type upgradeStep struct {
 	// already records that the node runs precisely what this upgrade would put
 	// on it, so there is nothing to do and no reason to reboot it.
 	already bool
+	// direction is how the node's running version relates to the target.
+	// DirectionUnknown when the running version could not be read, which is
+	// silence rather than a verdict.
+	direction talosctl.UpgradeDirection
 }
 
 // running is the Talos version the node reports, "" when it could not be read.
@@ -385,6 +412,7 @@ func planNodeUpgrades(cmd *cobra.Command, sess *cluster.Session, nodes []cluster
 		if image != "" {
 			step.image = image
 			step.already = policy.alreadyOnTarget(step)
+			step.direction = talosctl.ClassifyUpgrade(step.state.Version, talosctl.TagOf(step.image))
 			steps = append(steps, step)
 			continue
 		}
@@ -398,6 +426,7 @@ func planNodeUpgrades(cmd *cobra.Command, sess *cluster.Session, nodes []cluster
 		}
 		step.from, step.image = current, next
 		step.already = policy.alreadyOnTarget(step)
+		step.direction = talosctl.ClassifyUpgrade(step.state.Version, talosctl.TagOf(step.image))
 		steps = append(steps, step)
 	}
 	return steps, nil
@@ -598,6 +627,11 @@ func printUpgradePlan(cmd *cobra.Command, c cluster.Cluster, plan []upgradeStep,
 	// downgrade.
 	printDeclaredDrift(w, plan)
 
+	// A version Talos will not upgrade to is invisible in an installer
+	// reference, so it is called out rather than left to render like the patch
+	// bump beside it.
+	printVersionJumps(w, plan)
+
 	// A platform change is the one edit that can leave a node Ready while
 	// quietly breaking it, so it is called out rather than left for the reader
 	// to spot inside two long image references.
@@ -709,6 +743,119 @@ func printUpgradeRows(w io.Writer, plan []upgradeStep, lineage string) {
 		}
 		_, _ = fmt.Fprintf(w, "       to    %s\n", step.image)
 	}
+}
+
+// unsupportedJumps returns the steps whose transition Talos does not upgrade
+// between directly, in plan order.
+func unsupportedJumps(plan []upgradeStep) []upgradeStep {
+	var out []upgradeStep
+	for _, step := range plan {
+		if !step.direction.Supported() {
+			out = append(out, step)
+		}
+	}
+	return out
+}
+
+// printVersionJumps reports transitions Talos will not make, and says when the
+// check could not run at all.
+//
+// Both halves matter. A downgrade and a three-minor jump look exactly like the
+// patch bump beside them in a plan of installer references, and the guard being
+// unable to check is itself worth a line: an operator who has seen it catch a
+// mistake will otherwise read its silence as approval.
+func printVersionJumps(w io.Writer, plan []upgradeStep) {
+	for _, step := range unsupportedJumps(plan) {
+		_, _ = fmt.Fprintf(w, "   ⚠️  %s: %s → %s is %s\n", step.node.Name,
+			talosctl.NormalizeVersion(step.state.Version), talosctl.TagOf(step.image), step.direction)
+	}
+	if jumps := unsupportedJumps(plan); len(jumps) > 0 {
+		for _, line := range whyUnsupported(jumps) {
+			_, _ = fmt.Fprintf(w, "       %s\n", line)
+		}
+		_, _ = fmt.Fprintln(w, "       Pass --allow-unsupported-version to do it anyway.")
+		return
+	}
+	unchecked, noRunning := 0, 0
+	for _, step := range plan {
+		if step.direction == talosctl.DirectionUnknown {
+			unchecked++
+		}
+		if step.running() == "" {
+			noRunning++
+		}
+	}
+	// When no node reported a version at all, the current-version line has
+	// already said the plan is showing desired state. Repeating it here as a
+	// second note trains the reader past the line that means something — the
+	// partial case, where some nodes were checked and others were not.
+	if noRunning == len(plan) {
+		return
+	}
+	if unchecked > 0 {
+		// Not "no running version": the pair can also fail on the target, whose
+		// tag need not be a version at all. Naming the requirement rather than
+		// guessing which half was missing keeps the line true either way.
+		_, _ = fmt.Fprintf(w,
+			"   note:   version check skipped for %d of %d node(s) — needs both a running version and a\n"+
+				"           version-tagged target to compare\n",
+			unchecked, len(plan))
+	}
+}
+
+// whyUnsupported explains only the rules the plan actually breaks.
+//
+// The two have different reasons and different remedies, and printing both
+// every time means half the explanation does not apply to what is on screen —
+// which is how an operator learns that the paragraph is boilerplate.
+func whyUnsupported(jumps []upgradeStep) []string {
+	var downgrade, skip bool
+	for _, step := range jumps {
+		switch step.direction {
+		case talosctl.DirectionDowngrade:
+			downgrade = true
+		case talosctl.DirectionSkip:
+			skip = true
+		}
+	}
+	var out []string
+	if downgrade {
+		out = append(out,
+			"Talos does not go backwards: the installed system would be newer than the installer",
+			"writing over it.")
+	}
+	if skip {
+		out = append(out,
+			"Talos upgrades one minor version at a time; a skipped minor misses the migrations the",
+			"intervening release performs. Step through it.")
+	}
+	return out
+}
+
+// refuseUnsupportedVersions stops a run Talos cannot complete, naming what it
+// found rather than letting it fail part way through a rolling reboot.
+func refuseUnsupportedVersions(plan []upgradeStep, allowed bool) error {
+	jumps := unsupportedJumps(plan)
+	if len(jumps) == 0 || allowed {
+		return nil
+	}
+	first := jumps[0]
+	suffix := ""
+	if len(jumps) > 1 {
+		suffix = fmt.Sprintf(" (and %d other node(s))", len(jumps)-1)
+	}
+	// Stepping through an intervening release is the remedy for a skipped
+	// minor and nonsense for a downgrade, so only the applicable one is
+	// offered.
+	remedy := "Pass --allow-unsupported-version to do it anyway"
+	if first.direction == talosctl.DirectionSkip {
+		remedy = "Step through the intervening release, or pass --allow-unsupported-version to do it anyway"
+	}
+	return fmt.Errorf(
+		"%s runs %s and would be upgraded to %s, which is %s%s — Talos does not support that. "+
+			"%s. No node was upgraded and nothing was pinned",
+		first.node.Name, talosctl.NormalizeVersion(first.state.Version),
+		talosctl.TagOf(first.image), first.direction, suffix, remedy)
 }
 
 // bullet marks a row by whether it is work. A skipped node reads as done

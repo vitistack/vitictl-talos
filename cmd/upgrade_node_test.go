@@ -20,24 +20,32 @@ const (
 
 // step builds one plan entry the way planNodeUpgrades does.
 func step(name, role, declared, from, to string) upgradeStep {
-	return upgradeStep{
+	return classify(upgradeStep{
 		node:  cluster.Node{Name: name, Role: role, IP: "10.0.0.1", TalosVersion: declared},
 		from:  from,
 		image: to,
-	}
+	})
+}
+
+// classify fills in the direction the way planNodeUpgrades does, so a fixture
+// behaves like a real plan entry rather than one whose version check silently
+// never ran.
+func classify(s upgradeStep) upgradeStep {
+	s.direction = talosctl.ClassifyUpgrade(s.state.Version, talosctl.TagOf(s.image))
+	return s
 }
 
 // running marks a step with the version its node actually reports.
 func running(s upgradeStep, version string) upgradeStep {
 	s.state.Version = version
-	return s
+	return classify(s)
 }
 
 // onNode marks a step with the full state its node reports — the version and
 // the schematic, which is what the skip decision needs both halves of.
 func onNode(s upgradeStep, version, schematic string) upgradeStep {
 	s.state = cluster.NodeState{Version: version, Schematic: schematic}
-	return s
+	return classify(s)
 }
 
 // The plan's job is to show what is about to change. The version installed now
@@ -517,4 +525,128 @@ func TestPlanRendersStackopsAlreadyThere(t *testing.T) {
 		t.Fatalf("%d node(s) would still be rebooted", got)
 	}
 	t.Log("\n" + renderPlan(t, plan, pin{have: factoryBase + ":v1.13.9", want: factoryBase + ":v1.13.9"}))
+}
+
+// A downgrade and a skipped minor look exactly like the patch bump beside them
+// in a plan of installer references, so the plan has to say which is which.
+func TestPlanNamesUnsupportedVersionJumps(t *testing.T) {
+	plan := []upgradeStep{
+		running(step("t-x-ctp0", cluster.RoleControlPlane, "", factoryBase+":v1.13.9",
+			factoryBase+":v1.13.8"), "1.13.9"),
+		running(step("t-x-wrk0", cluster.RoleWorker, "", factoryBase+":v1.11.2",
+			factoryBase+":v1.13.8"), "1.11.2"),
+	}
+	out := renderPlan(t, plan, pin{})
+
+	if !strings.Contains(out, "t-x-ctp0: v1.13.9 → v1.13.8 is a downgrade") {
+		t.Errorf("plan does not name the downgrade:\n%s", out)
+	}
+	if !strings.Contains(out, "t-x-wrk0: v1.11.2 → v1.13.8 is a minor-version skip") {
+		t.Errorf("plan does not name the skipped minor:\n%s", out)
+	}
+	if !strings.Contains(out, "--allow-unsupported-version") {
+		t.Errorf("plan does not say how to proceed anyway:\n%s", out)
+	}
+}
+
+// The refusal must land before the pin moves. The pin is written ahead of any
+// node precisely so an interrupted run gets finished rather than undone, so a
+// pin recording a version Talos will not upgrade to would have the operator
+// keep being driven toward it.
+func TestRefusesUnsupportedVersionsUnlessAllowed(t *testing.T) {
+	downgrade := running(step("t-x-ctp0", cluster.RoleControlPlane, "",
+		factoryBase+":v1.13.9", factoryBase+":v1.13.8"), "1.13.9")
+	skip := running(step("t-x-wrk0", cluster.RoleWorker, "",
+		factoryBase+":v1.11.2", factoryBase+":v1.13.8"), "1.11.2")
+	plan := []upgradeStep{downgrade, skip}
+
+	err := refuseUnsupportedVersions(plan, false)
+	if err == nil {
+		t.Fatal("an unsupported transition was allowed through")
+	}
+	for _, want := range []string{"t-x-ctp0", "v1.13.9", "v1.13.8", "a downgrade",
+		"and 1 other node(s)", "--allow-unsupported-version", "nothing was pinned"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not mention %q: %v", want, err)
+		}
+	}
+
+	if err := refuseUnsupportedVersions(plan, true); err != nil {
+		t.Errorf("--allow-unsupported-version did not let the run proceed: %v", err)
+	}
+}
+
+// The transitions Talos does support must pass without comment, or the guard
+// becomes noise an operator learns to scroll past.
+func TestSupportedUpgradesPassSilently(t *testing.T) {
+	for _, tc := range []struct{ name, from, to string }{
+		{"patch forward", "1.13.5", "v1.13.9"},
+		{"one minor forward", "1.12.7", "v1.13.8"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := []upgradeStep{running(step("t-x-ctp0", cluster.RoleControlPlane, "",
+				factoryBase+":"+tc.from, factoryBase+":"+tc.to), tc.from)}
+			if err := refuseUnsupportedVersions(plan, false); err != nil {
+				t.Errorf("refused a supported upgrade: %v", err)
+			}
+			if out := renderPlan(t, plan, pin{}); strings.Contains(out, "⚠️") {
+				t.Errorf("plan warns about a supported upgrade:\n%s", out)
+			}
+		})
+	}
+}
+
+// Never refuse on "cannot tell". A cluster whose running version is unavailable
+// is one of the clusters this command exists to rescue, and the guard blocking
+// it would be the same mistake as skipping a node that would not answer.
+func TestUnreadableVersionsNeverRefuse(t *testing.T) {
+	plan := []upgradeStep{
+		step("t-x-ctp0", cluster.RoleControlPlane, "", factoryBase+":v1.13.5", factoryBase+":v1.13.9"),
+	}
+	if err := refuseUnsupportedVersions(plan, false); err != nil {
+		t.Errorf("refused a run whose running version could not be read: %v", err)
+	}
+}
+
+// A guard that silently could not run reads as approval to anyone who has seen
+// it work, so a partial gap is stated. A total one is not: the current-version
+// line has already said the plan is showing desired state.
+func TestPlanReportsAPartialVersionCheck(t *testing.T) {
+	plan := []upgradeStep{
+		running(step("t-x-ctp0", cluster.RoleControlPlane, "", factoryBase+":v1.13.5",
+			factoryBase+":v1.13.9"), "1.13.5"),
+		step("t-x-wrk0", cluster.RoleWorker, "", factoryBase+":v1.13.5", factoryBase+":v1.13.9"),
+	}
+	if out := renderPlan(t, plan, pin{}); !strings.Contains(out, "version check skipped for 1 of 2") {
+		t.Errorf("plan does not say the guard could not cover every node:\n%s", out)
+	}
+
+	none := []upgradeStep{
+		step("t-x-ctp0", cluster.RoleControlPlane, "", factoryBase+":v1.13.5", factoryBase+":v1.13.9"),
+	}
+	if out := renderPlan(t, none, pin{}); strings.Contains(out, "version check skipped") {
+		t.Errorf("plan repeats what the current-version line already said:\n%s", out)
+	}
+}
+
+// The operator's first run, which the old plan rendered as a downgrade from a
+// version nothing was running. Kept as an eyeball test.
+func TestPlanRendersRealMinorUpgrade(t *testing.T) {
+	plan := []upgradeStep{
+		running(step("t-jraviti-123-vexr-ctp0", cluster.RoleControlPlane, "1.13.9",
+			factoryBase+":v1.12.7", factoryBase+":v1.13.8"), "1.12.7"),
+		running(step("t-jraviti-123-vexr-wrk0", cluster.RoleWorker, "1.13.9",
+			factoryBase+":v1.12.7", factoryBase+":v1.13.8"), "1.12.7"),
+	}
+	t.Log("\n" + renderPlan(t, plan, pin{have: factoryBase + ":v1.12.7", want: factoryBase + ":v1.13.8"}))
+}
+
+// The same fleet pointed backwards.
+func TestPlanRendersRefusedDowngrade(t *testing.T) {
+	plan := []upgradeStep{
+		running(step("d-stackops-1010-qjxq-ctp0", cluster.RoleControlPlane, "1.13.9",
+			factoryBase+":v1.13.5", factoryBase+":v1.13.7"), "1.13.9"),
+	}
+	t.Log("\n" + renderPlan(t, plan, pin{have: factoryBase + ":v1.13.9", want: factoryBase + ":v1.13.7"}))
+	t.Log("refusal: " + refuseUnsupportedVersions(plan, false).Error())
 }
