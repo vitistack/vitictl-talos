@@ -481,6 +481,46 @@ When every targeted node has arrived, the pin is still reconciled — the nodes
 are there, and leaving the operator's desired state behind them would have it
 undo their arrival — and the command exits without touching anything.
 
+### Transitions Talos will not make are refused
+
+Talos upgrades **one minor version at a time** and **does not go backwards**.
+Neither rule is visible in an installer reference, so a downgrade and a
+three-minor jump render exactly like the patch bump beside them:
+
+```
+   • d-stackops-1010-qjxq-ctp0    controlplane     v1.13.9 → v1.13.7
+   ⚠️  d-stackops-1010-qjxq-ctp0: v1.13.9 → v1.13.7 is a downgrade
+       Talos does not go backwards: the installed system would be newer than the installer
+       writing over it.
+       Pass --allow-unsupported-version to do it anyway.
+```
+
+The run is refused **before the pin moves**. The pin is written ahead of any
+node precisely so an interrupted run gets finished rather than undone — which
+means a pin recording a version Talos will not upgrade to would have the
+operator keep being driven toward it.
+
+The comparison is against **what each node runs**, which is what makes the
+guard usable. `spec.os.imageID` runs ahead of the nodes and
+`machine.install.image` lags behind them, so a guard built on either would
+refuse legitimate upgrades: the first real run of this command was
+`v1.12.7 → v1.13.8` — a legal one-minor step — while the machines declared
+`v1.13.9`. Checked against the declared version, that reads as a downgrade and
+would have been blocked.
+
+**A version that cannot be read is never a refusal.** A cluster whose running
+version is unavailable is one of the clusters this command exists to rescue.
+The check says it could not run rather than blocking:
+
+```
+   note:   version check skipped for 1 of 4 node(s) — needs both a running version and a
+           version-tagged target to compare
+```
+
+That line appears only for a *partial* gap. When no node reported a version at
+all, the `current:` line has already said the plan is showing desired state, and
+repeating it would train the reader past the case that means something.
+
 `--image` overrides that outright. Matching the schematic and the platform is
 then yours to get right.
 
