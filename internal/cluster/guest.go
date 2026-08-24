@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +18,10 @@ import (
 // runs.
 const TalosVersionEnforcementCondition = "TalosVersionEnforcement"
 
+// SchematicAnnotation is the Node annotation through which Talos publishes the
+// Image Factory schematic a node is actually built from.
+const SchematicAnnotation = "extensions.talos.dev/schematic"
+
 // guestReadTimeout bounds the guest-cluster read.
 //
 // Without a bound this read defeats its own purpose. It is best-effort because
@@ -26,23 +31,40 @@ const TalosVersionEnforcementCondition = "TalosVersionEnforcement"
 // Fifteen seconds matches what vitictl allows its own version read.
 const guestReadTimeout = 15 * time.Second
 
-// RunningVersions returns the Talos version each of a cluster's nodes actually
-// runs, keyed by the node's name.
+// NodeState is what a node reports about itself, as opposed to what anything
+// in the management cluster wishes it were running.
+type NodeState struct {
+	// Version is the Talos version the kubelet reports, without its leading v.
+	Version string
+	// Schematic is the Image Factory schematic id the node is actually built
+	// from, "" when the node does not publish one.
+	Schematic string
+}
+
+// RunningState returns what each of a cluster's nodes actually runs, keyed by
+// node name.
 //
-// The source is the guest cluster's own Node objects —
-// status.nodeInfo.osImage, "Talos (v1.13.7)", what the kubelet reports — which
-// is the only per-node account of reality available from the management side.
-// Everything else the management cluster holds is desired state: see the note
-// on the parsers in version.go.
+// Both halves come from the guest cluster's own Node objects, which is the only
+// per-node account of reality available from the management side — everything
+// the management cluster holds is desired state, and this cluster proved how
+// far that can drift: two upgrades after v1.13.5, with the nodes on v1.13.9 and
+// the pin on v1.13.9, machine.install.image still read v1.13.5.
 //
-// It costs one List against the guest cluster, reached with the kubeconfig
-// already sitting in the same Secret this package mints talosconfigs from. No
-// Talos API call and no second credential.
+//   - Version from status.nodeInfo.osImage, "Talos (v1.13.9)".
+//   - Schematic from the extensions.talos.dev/schematic annotation. Talos lists
+//     it in talos.dev/owned-annotations, so the node maintains it rather than it
+//     being stamped once at provisioning time. Note it is an annotation: the
+//     labels carry the individual extensions (iscsi-tools, qemu-guest-agent, …)
+//     and never the schematic id, so a label lookup finds nothing and concludes
+//     the wrong thing.
 //
-// A node the guest cluster does not know about is absent from the result
-// rather than present with an empty version, and the two must not be conflated
-// by callers: "not upgraded" and "cannot tell" lead to opposite decisions.
-func RunningVersions(ctx context.Context, c Cluster) (map[string]string, error) {
+// One List, reached with the kubeconfig already sitting in the same Secret this
+// package mints talosconfigs from. No Talos API call and no second credential.
+//
+// A node the guest cluster does not know about is absent from the result rather
+// than present and empty, and callers must not conflate the two: "cannot tell"
+// and "not upgraded" lead to opposite decisions.
+func RunningState(ctx context.Context, c Cluster) (map[string]NodeState, error) {
 	ctx, cancel := context.WithTimeout(ctx, guestReadTimeout)
 	defer cancel()
 
@@ -52,7 +74,7 @@ func RunningVersions(ctx context.Context, c Cluster) (map[string]string, error) 
 	}
 	raw, ok := secret.Data[KeyKubeConfig]
 	if !ok || len(raw) == 0 {
-		return nil, fmt.Errorf("secret %s/%s has no %q entry, so the nodes' running versions cannot be read",
+		return nil, fmt.Errorf("secret %s/%s has no %q entry, so the nodes' running state cannot be read",
 			secret.Namespace, secret.Name, KeyKubeConfig)
 	}
 	cfg, err := clientcmd.RESTConfigFromKubeConfig(raw)
@@ -78,12 +100,20 @@ func RunningVersions(ctx context.Context, c Cluster) (map[string]string, error) 
 	if err := cl.List(ctx, &nodes); err != nil {
 		return nil, fmt.Errorf("listing nodes of cluster %s: %w", c.Describe(), err)
 	}
-	out := make(map[string]string, len(nodes.Items))
+	out := make(map[string]NodeState, len(nodes.Items))
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
-		if v := VersionFromOSImage(n.Status.NodeInfo.OSImage); v != "" {
-			out[n.Name] = v
+		state := NodeState{
+			Version:   VersionFromOSImage(n.Status.NodeInfo.OSImage),
+			Schematic: strings.TrimSpace(n.Annotations[SchematicAnnotation]),
 		}
+		// A node reporting neither is not a Talos node this command can reason
+		// about, and recording it as known-but-empty would let a caller read it
+		// as "runs nothing".
+		if state.Version == "" && state.Schematic == "" {
+			continue
+		}
+		out[n.Name] = state
 	}
 	return out, nil
 }

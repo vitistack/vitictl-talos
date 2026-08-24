@@ -291,6 +291,20 @@ func PlatformOf(ref string) string {
 	return parsed.platform()
 }
 
+// SchematicOf returns the Image Factory schematic an installer reference is
+// built from, or "" when the reference is not a factory image.
+//
+// It is what makes an upgrade's target comparable to what a node reports
+// running: a version match alone is not enough, since --schematic changes the
+// extensions while leaving the version alone.
+func SchematicOf(ref string) string {
+	parsed, ok := parseInstallerRef(ref)
+	if !ok {
+		return ""
+	}
+	return parsed.schematic
+}
+
 // parseInstallerRef splits a factory installer reference into its parts,
 // reporting false for anything that is not one.
 func parseInstallerRef(ref string) (installerRef, bool) {

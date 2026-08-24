@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/vitistack/vitictl-talos/internal/cluster"
+	"github.com/vitistack/vitictl-talos/internal/talosctl"
 )
 
 const (
@@ -28,7 +29,14 @@ func step(name, role, declared, from, to string) upgradeStep {
 
 // running marks a step with the version its node actually reports.
 func running(s upgradeStep, version string) upgradeStep {
-	s.running = version
+	s.state.Version = version
+	return s
+}
+
+// onNode marks a step with the full state its node reports — the version and
+// the schematic, which is what the skip decision needs both halves of.
+func onNode(s upgradeStep, version, schematic string) upgradeStep {
+	s.state = cluster.NodeState{Version: version, Schematic: schematic}
 	return s
 }
 
@@ -55,7 +63,8 @@ func TestPlanShowsInstalledVersionNotDeclared(t *testing.T) {
 	}
 	// With no running version the baseline is what the configs install, and a
 	// declared version ahead of it is exactly what this note exists for.
-	if !strings.Contains(out, "configs install v1.12.7, but machines declare v1.13.9 in spec.os.imageID") {
+	if !strings.Contains(out, "configs install v1.12.7, but machines declare v1.13.9 in spec.os.imageID") ||
+		!strings.Contains(out, "does not track what booted") {
 		t.Errorf("plan does not name the declared/installed disagreement:\n%s", out)
 	}
 	if !strings.Contains(out, "current: what each node's config installs") {
@@ -120,7 +129,7 @@ func renderPlan(t *testing.T, plan []upgradeStep, p pin) string {
 	var buf bytes.Buffer
 	cmd := &cobra.Command{}
 	cmd.SetErr(&buf)
-	printUpgradePlan(cmd, cluster.Cluster{}, plan, false, p)
+	printUpgradePlan(cmd, cluster.Cluster{}, plan, false, p, skipPolicy{enabled: true})
 	return buf.String()
 }
 
@@ -338,4 +347,174 @@ func TestPlanRendersStackopsScenario(t *testing.T) {
 			factoryBase+":v1.13.7", factoryBase+":v1.13.9"), "1.13.7"))
 	}
 	t.Log("\n" + renderPlan(t, plan, pin{have: factoryBase + ":v1.13.7", want: factoryBase + ":v1.13.9"}))
+}
+
+const schematicB = "b0f2a8b575460a3dcb1234cc081c73c88e795aaef36eda9b88a6f4dddbd49365"
+
+// A node running exactly what the upgrade would install has nothing to gain
+// from a reboot. This is the d-stackops-1010 case: four healthy nodes on
+// v1.13.9, a plan reading "v1.13.9 → v1.13.9", and every one of them rebooted.
+func TestSkipsNodeAlreadyOnTarget(t *testing.T) {
+	p := newSkipPolicy(talosctl.ImageEdit{Version: "v1.13.9"}, "", false)
+	s := onNode(step("t-x-ctp0", cluster.RoleControlPlane, "", factoryBase+":v1.13.5",
+		factoryBase+":v1.13.9"), "1.13.9", schematicB)
+
+	if !p.alreadyOnTarget(s) {
+		t.Error("node running the target version and schematic was not recognised as already there")
+	}
+}
+
+// The safety property this whole design turns on. A node that could not be read
+// is the node a half-finished run left behind — it is NotReady, which is exactly
+// why it did not answer. Reading that silence as "already upgraded" would strand
+// the one node the command was run for.
+func TestNeverSkipsWhatItCannotVerify(t *testing.T) {
+	p := newSkipPolicy(talosctl.ImageEdit{Version: "v1.13.9"}, "", false)
+	target := factoryBase + ":v1.13.9"
+
+	for _, tc := range []struct {
+		name               string
+		version, schematic string
+	}{
+		{"node did not answer at all", "", ""},
+		{"version known, schematic absent", "1.13.9", ""},
+		{"schematic known, version absent", "", schematicB},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := onNode(step("t-x-wrk3", cluster.RoleWorker, "", factoryBase+":v1.13.5", target),
+				tc.version, tc.schematic)
+			if p.alreadyOnTarget(s) {
+				t.Error("skipped a node whose state could not be fully verified")
+			}
+		})
+	}
+}
+
+// Matching the version is not enough: --schematic changes the extensions while
+// leaving the version alone, so "v1.13.9 → v1.13.9" can be real work.
+func TestDoesNotSkipASchematicChange(t *testing.T) {
+	other := "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+	p := newSkipPolicy(talosctl.ImageEdit{Schematic: other}, "", false)
+	s := onNode(step("t-x-ctp0", cluster.RoleControlPlane, "", factoryBase+":v1.13.9",
+		"factory.talos.dev/nocloud-installer/"+other+":v1.13.9"), "1.13.9", schematicB)
+
+	if p.alreadyOnTarget(s) {
+		t.Error("skipped a node whose schematic is being changed — same version, different extensions")
+	}
+}
+
+// A Node object reports its version and its schematic and nothing else. An edit
+// that moves a part the node cannot report is unverifiable, and --platform is
+// the one where a wrong skip does not fail loudly: the node stays Ready with its
+// config source silently gone.
+func TestSkippingIsOffForUnverifiableEdits(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		edit  talosctl.ImageEdit
+		image string
+		force bool
+		want  string
+	}{
+		{name: "platform", edit: talosctl.ImageEdit{Platform: "hcloud"}, want: "--platform"},
+		{name: "registry", edit: talosctl.ImageEdit{Registry: "mirror.local"}, want: "--registry"},
+		{name: "whole image replaced", image: factoryBase + ":v1.13.9", want: "--image"},
+		{name: "force", edit: talosctl.ImageEdit{Version: "v1.13.9"}, force: true, want: "--force"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newSkipPolicy(tc.edit, tc.image, tc.force)
+			if p.enabled {
+				t.Fatalf("skipping is enabled for %s, which cannot be checked against a Node object", tc.name)
+			}
+			if !strings.Contains(p.reason, tc.want) {
+				t.Errorf("reason %q does not name %s", p.reason, tc.want)
+			}
+			// Even a node that plainly matches must not be skipped here.
+			s := onNode(step("t-x-ctp0", cluster.RoleControlPlane, "", factoryBase+":v1.13.9",
+				factoryBase+":v1.13.9"), "1.13.9", schematicB)
+			if p.alreadyOnTarget(s) {
+				t.Error("a disabled policy skipped a node anyway")
+			}
+		})
+	}
+}
+
+// The plan must not claim to be upgrading nodes it will not touch, and must say
+// which ones those are.
+func TestPlanSeparatesWorkFromNodesAlreadyThere(t *testing.T) {
+	done := onNode(step("t-x-ctp0", cluster.RoleControlPlane, "", factoryBase+":v1.13.5",
+		factoryBase+":v1.13.9"), "1.13.9", schematicB)
+	done.already = true
+	pending := onNode(step("t-x-wrk0", cluster.RoleWorker, "", factoryBase+":v1.13.5",
+		factoryBase+":v1.13.9"), "1.13.7", schematicB)
+
+	plan := []upgradeStep{done, pending}
+	if got := len(todo(plan)); got != 1 {
+		t.Fatalf("todo() returned %d steps, want 1", got)
+	}
+
+	out := renderPlan(t, plan, pin{})
+	if !strings.Contains(out, "Upgrading 1 of 2 node(s)") {
+		t.Errorf("plan claims to upgrade nodes it will not touch:\n%s", out)
+	}
+	if !strings.Contains(out, "✓ t-x-ctp0") || !strings.Contains(out, "already on target, not touched") {
+		t.Errorf("plan does not mark the node it is skipping:\n%s", out)
+	}
+	if !strings.Contains(out, "• t-x-wrk0") {
+		t.Errorf("plan does not mark the node it will act on:\n%s", out)
+	}
+}
+
+// A whole cluster already there should say so plainly rather than announcing an
+// upgrade of zero nodes.
+func TestPlanSaysWhenThereIsNothingToDo(t *testing.T) {
+	s := onNode(step("t-x-ctp0", cluster.RoleControlPlane, "", factoryBase+":v1.13.5",
+		factoryBase+":v1.13.9"), "1.13.9", schematicB)
+	s.already = true
+
+	out := renderPlan(t, []upgradeStep{s}, pin{})
+	if !strings.Contains(out, "All 1 targeted node(s)") || !strings.Contains(out, "already run the target") {
+		t.Errorf("plan does not say the cluster has arrived:\n%s", out)
+	}
+	if strings.Contains(out, "effect:") {
+		t.Errorf("plan describes the effect of an upgrade that will not happen:\n%s", out)
+	}
+}
+
+// Skipping being off is a fact about the run, and a fleet of no-op reboots must
+// never look deliberate by omission.
+func TestPlanStatesWhySkippingIsOff(t *testing.T) {
+	var buf bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&buf)
+	plan := []upgradeStep{onNode(step("t-x-ctp0", cluster.RoleControlPlane, "",
+		factoryBase+":v1.13.9", factoryBase+":v1.13.9"), "1.13.9", schematicB)}
+
+	printUpgradePlan(cmd, cluster.Cluster{}, plan, false, pin{},
+		newSkipPolicy(talosctl.ImageEdit{Platform: "hcloud"}, "", false))
+
+	if out := buf.String(); !strings.Contains(out, "skip:   off — --platform") {
+		t.Errorf("plan does not say why nothing is being skipped:\n%s", out)
+	}
+}
+
+// d-stackops-1010 the second time round: the plan that started this change.
+func TestPlanRendersStackopsAlreadyThere(t *testing.T) {
+	names := []string{"d-stackops-1010-qjxq-ctp0", "d-stackops-1010-qjxq-wrk0",
+		"d-stackops-1010-qjxq-wrk1", "d-stackops-1010-qjxq-wrk2"}
+	policy := newSkipPolicy(talosctl.ImageEdit{Version: "v1.13.9"}, "", false)
+	plan := make([]upgradeStep, 0, len(names))
+	for i, n := range names {
+		role := cluster.RoleWorker
+		if i == 0 {
+			role = cluster.RoleControlPlane
+		}
+		s := onNode(step(n, role, "1.13.9", factoryBase+":v1.13.5", factoryBase+":v1.13.9"),
+			"1.13.9", schematicB)
+		s.already = policy.alreadyOnTarget(s)
+		plan = append(plan, s)
+	}
+	if got := len(todo(plan)); got != 0 {
+		t.Fatalf("%d node(s) would still be rebooted", got)
+	}
+	t.Log("\n" + renderPlan(t, plan, pin{have: factoryBase + ":v1.13.9", want: factoryBase + ":v1.13.9"}))
 }
