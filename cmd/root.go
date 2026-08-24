@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -153,6 +154,53 @@ func warn(cmd *cobra.Command, err error) {
 // echo reports a resolved choice on stderr, so stdout stays pipeable.
 func echo(cmd *cobra.Command, what string) {
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "▶ %s\n", what)
+}
+
+// commandName renders how the reader should invoke a command, which is not
+// necessarily how cobra names it.
+//
+// This binary is a viti-* plugin: it is typed as "viti talos ..." while its
+// cobra root is named viti-talos, so cmd.CommandPath() spells it the one way
+// nothing else in this tool does — every Example block and every line of the
+// README says "viti talos". For a command printed to be pasted, that
+// difference is the whole point of printing it.
+//
+// The invoked form cannot be recovered. vitictl's dispatcher reaches the
+// plugin through syscall.Exec with argv[0] set to the resolved binary path and
+// adds no environment marker, so "viti talos upgrade-node" and a standalone
+// "viti-talos upgrade-node" are indistinguishable from in here. It therefore
+// has to be inferred from the binary name — and the "viti" lookup is what
+// keeps the inference honest: a standalone install with no vitictl beside it
+// gets back the name it was actually invoked as, which is the only one that
+// would run.
+func commandName(cmd *cobra.Command) string {
+	_, err := exec.LookPath("viti")
+	return invocationName(os.Args[0], cmd.CommandPath(), cmd.Root().Name(), err == nil)
+}
+
+// invocationName is commandName's decision, separated from the process and the
+// PATH so it can be tested against every case rather than the one the test
+// binary happens to run as.
+func invocationName(argv0, commandPath, rootName string, vitiOnPath bool) string {
+	// Both separators, rather than filepath.Base: that treats a backslash as
+	// one only in a Windows build, which would make this depend on the host it
+	// runs on for no benefit — argv0 is a path either way.
+	base := argv0
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	// A "viti-t" argv0 is the alias symlink, and rendering it as "viti t"
+	// matches what its user typed rather than renaming their shorthand.
+	base = strings.TrimSuffix(base, ".exe")
+	suffix, ok := strings.CutPrefix(base, "viti-")
+	if !ok || suffix == "" || !vitiOnPath {
+		return commandPath
+	}
+	name := "viti " + suffix
+	if sub := strings.TrimSpace(strings.TrimPrefix(commandPath, rootName)); sub != "" {
+		name += " " + sub
+	}
+	return name
 }
 
 // contextOrBackground keeps helpers usable from tests that build a bare
