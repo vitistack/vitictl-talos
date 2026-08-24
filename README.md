@@ -392,7 +392,7 @@ A Talos cluster reports its version from three places:
 | Source | What it is |
 | ------ | ---------- |
 | `Machine spec.os.imageID` | **Declared.** The operator bumps it to the newest *available* image ahead of any upgrade — observed 112 days ahead of reality |
-| `machine.install.image` on the node | **Installed.** What the config says to install, reconciled from the cluster's pinned `install_image` — which this command moves *before* touching a node |
+| `machine.install.image` on the node | **Installed.** What the config said to install *at provisioning time*. No upgrade writes it back — `d-stackops-1010` sat two upgrades past v1.13.5 with its nodes on v1.13.9, its pin on v1.13.9, and this field still reading v1.13.5 |
 | `Node status.nodeInfo.osImage` in the guest cluster | **Running.** `Talos (v1.13.7)`, what the kubelet reports. The only one that is not a wish |
 
 The plan reads the third. It comes from the guest cluster's own Node objects,
@@ -428,6 +428,58 @@ to the installed version, each time saying which:
 
 This is the same distinction `viti kc list` draws with its `~` prefix:
 `~1.13.9` means *unverified — machine image target only, runtime unknown*.
+
+### Nodes already on the target are left alone
+
+An upgrade to where a node already is costs a reboot and buys nothing. So a node
+running exactly what the upgrade would install is skipped:
+
+```
+✅ All 4 targeted node(s) of admin@pos1-mgmt-001/vitistack-stackops/d-stackops-1010 already run the target
+   image:  factory.talos.dev/nocloud-installer/b0f2…9365
+   current: what each node runs now, from the guest cluster's own Node objects
+   ✓ d-stackops-1010-qjxq-ctp0    controlplane     v1.13.9 → v1.13.9   already on target, not touched
+   ✓ d-stackops-1010-qjxq-wrk0    worker           v1.13.9 → v1.13.9   already on target, not touched
+   ✓ d-stackops-1010-qjxq-wrk1    worker           v1.13.9 → v1.13.9   already on target, not touched
+   ✓ d-stackops-1010-qjxq-wrk2    worker           v1.13.9 → v1.13.9   already on target, not touched
+   pin:    install_image already v1.13.9
+```
+
+**Both the version and the schematic must match**, and both come from the node
+itself — `status.nodeInfo.osImage` and the `extensions.talos.dev/schematic`
+annotation, which Talos lists in `talos.dev/owned-annotations` and so keeps
+current. Version alone is not enough: `--schematic <new-id>` changes the
+extensions while leaving the version alone, so `v1.13.9 → v1.13.9` can be real
+work.
+
+Note the schematic is an *annotation*. The **labels** carry the individual
+extensions (`extensions.talos.dev/iscsi-tools`, `qemu-guest-agent`, …) and never
+the schematic id, so a label lookup finds nothing and concludes the wrong thing.
+
+**A node that cannot be verified is always upgraded.** Both halves must be
+known and both must match; anything else means *cannot tell*, and the answer to
+that is never "skip". The node a half-finished run left behind is precisely the
+one that fails to answer — it is `NotReady`, which is why it did not — and
+reading its silence as "already done" would strand the only node the command
+was run for.
+
+Skipping is off entirely for anything a Node object cannot report, and the plan
+says which:
+
+```
+   skip:   off — --platform changes where Talos reads its config on the next boot, which a node does not report — no node is skipped
+```
+
+| Flag | Why skipping is off |
+| ---- | ------------------- |
+| `--platform` | No counterpart on the node, and a wrong skip does not fail loudly — the node stays `Ready` with its config source gone |
+| `--registry` | Cannot be checked against what the nodes report |
+| `--image` | Replaces the whole reference, so its registry and platform are whatever was typed |
+| `--force` | Asked for: upgrade every node regardless, for reinstalling over one that reports the right version but is not behaving like it |
+
+When every targeted node has arrived, the pin is still reconciled — the nodes
+are there, and leaving the operator's desired state behind them would have it
+undo their arrival — and the command exits without touching anything.
 
 `--image` overrides that outright. Matching the schematic and the platform is
 then yours to get right.

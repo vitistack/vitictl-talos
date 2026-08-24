@@ -26,6 +26,7 @@ func newUpgradeNodeCmd(s *scope) *cobra.Command {
 		platform  string
 		registry  string
 		noPin     bool
+		force     bool
 	)
 
 	cmd := &cobra.Command{
@@ -105,6 +106,22 @@ node's resolved image before anything is touched.
 not the one you want. It is your responsibility to have matched the schematic
 and the platform.
 
+A node that already runs exactly what the upgrade would install is left alone.
+That comparison is against what the node reports — its Talos version and its
+Image Factory schematic, both read from the guest cluster's own Node object —
+and never against machine.install.image, which no upgrade writes back and which
+has been observed two upgrades stale. Both halves must be known and both must
+match: a node that cannot be read is upgraded, because the node a half-finished
+run left behind is precisely the one that fails to answer, and reading silence
+as "already done" would strand it.
+
+Skipping is off entirely for anything a Node object cannot report. --platform
+and --registry are positional parts of the reference with no counterpart on the
+node, and --image replaces the reference outright, so under any of those every
+targeted node is upgraded and the plan says so. --force does the same on
+demand, for reinstalling over a node that reports the right version but is not
+behaving like it.
+
 Note that the talos-operator also enforces a cluster's Talos version. Running
 this by hand is for the cases the operator cannot resolve — an upgrade that
 needs stepping by hand, or a node it has given up on.`,
@@ -114,8 +131,12 @@ needs stepping by hand, or a node it has given up on.`,
   # One node only, staged so it takes effect on the next reboot.
   viti talos upgrade-node my-cluster -N my-cluster-wrk0 --to v1.13.9 --stage
 
-  # See exactly which image each node would get, changing nothing.
+  # See exactly which image each node would get, changing nothing. Nodes already
+  # on the target are shown with a tick and would not be touched.
   viti talos upgrade-node my-cluster --to v1.13.9 --dry-run
+
+  # Reinstall over a node that reports the target but is not behaving like it.
+  viti talos upgrade-node my-cluster -N my-cluster-wrk0 --to v1.13.9 --force
 
   # Add system extensions by moving to a new schematic, same Talos version.
   viti talos upgrade-node my-cluster --schematic <64-hex-id> --dry-run
@@ -154,15 +175,20 @@ needs stepping by hand, or a node it has given up on.`,
 			}
 			defer sess.Close()
 
-			plan, err := planNodeUpgrades(cmd, sess, nodes, edit, image)
+			policy := newSkipPolicy(edit, image, force)
+			plan, err := planNodeUpgrades(cmd, sess, nodes, edit, image, policy)
 			if err != nil {
 				return err
 			}
+			// The pin is resolved from the whole plan, not just the work: it is
+			// the cluster's desired state, and a run where every node already
+			// arrived must still leave that state correct.
 			pin, err := pinTarget(cmd, sess.Cluster(), plan, noPin)
 			if err != nil {
 				return err
 			}
-			printUpgradePlan(cmd, sess.Cluster(), plan, stage, pin)
+			printUpgradePlan(cmd, sess.Cluster(), plan, stage, pin, policy)
+			work := todo(plan)
 			if dryRun {
 				_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
 					"🔎 dry run — nothing was upgraded and nothing was pinned. Every image above was "+
@@ -170,9 +196,24 @@ needs stepping by hand, or a node it has given up on.`,
 				return nil
 			}
 
+			// Nothing to do is a success, and it is still worth reconciling the
+			// pin: the nodes have arrived, and leaving the operator's desired
+			// state behind them would have it undo their arrival.
+			if len(work) == 0 {
+				if pin.needed() {
+					if err := cluster.PinInstallImage(contextOrBackground(cmd), sess.Cluster(), pin.want); err != nil {
+						return err
+					}
+					echo(cmd, "pinned install_image = "+pin.want)
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"✅ every targeted node already runs the target — nothing to upgrade\n")
+				return nil
+			}
+
 			if !yes {
 				ok, err := confirm(cmd, fmt.Sprintf("Upgrade %d node(s) of %s, one at a time?",
-					len(plan), sess.Cluster().Name()))
+					len(work), sess.Cluster().Name()))
 				if err != nil {
 					return err
 				}
@@ -192,7 +233,7 @@ needs stepping by hand, or a node it has given up on.`,
 				echo(cmd, "pinned install_image = "+pin.want)
 			}
 
-			for i, step := range plan {
+			for i, step := range work {
 				target := talosctl.Target{
 					Talosconfig: sess.Talosconfig,
 					Endpoints:   sess.Endpoints(),
@@ -210,9 +251,9 @@ needs stepping by hand, or a node it has given up on.`,
 				echo(cmd, fmt.Sprintf("upgrading %s (%s) → %s", step.node.Name, step.node.IP, step.image))
 				if err := talosctl.Run(contextOrBackground(cmd), streams(cmd), target, "upgrade", extra...); err != nil {
 					printUpgradeFailure(cmd, upgradeFailure{
-						remaining:   plan[i:],
+						remaining:   work[i:],
 						done:        i,
-						total:       len(plan),
+						total:       len(work),
 						stage:       stage,
 						noDrain:     noDrain,
 						pin:         pin,
@@ -220,7 +261,7 @@ needs stepping by hand, or a node it has given up on.`,
 						passthrough: passthrough,
 					})
 					return fmt.Errorf("node %s: %w — %d of %d node(s) upgraded, the rest were not touched",
-						step.node.Name, err, i, len(plan))
+						step.node.Name, err, i, len(work))
 				}
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✅ %s upgraded\n", step.node.Name)
 			}
@@ -246,6 +287,8 @@ needs stepping by hand, or a node it has given up on.`,
 		"skip cordoning and draining the Kubernetes node before rebooting it")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false,
 		"resolve and print the per-node installer images, then stop without upgrading")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"upgrade every targeted node, including any already running the target image")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip the confirmation prompt")
 	return cmd
 }
@@ -259,11 +302,18 @@ type upgradeStep struct {
 	// platform is what the node reports running as, read only when the
 	// platform is about to change.
 	platform string
-	// running is the Talos version the node actually runs, "" when it could
-	// not be read. Empty means "cannot tell", never "not upgraded" — the two
-	// lead to opposite decisions.
-	running string
+	// state is what the node reports running. A zero value means "cannot
+	// tell", never "not upgraded" — the two lead to opposite decisions, and
+	// treating a node that could not be read as already-upgraded would skip
+	// exactly the node a half-finished run left behind.
+	state cluster.NodeState
+	// already records that the node runs precisely what this upgrade would put
+	// on it, so there is nothing to do and no reason to reboot it.
+	already bool
 }
+
+// running is the Talos version the node reports, "" when it could not be read.
+func (s upgradeStep) running() string { return s.state.Version }
 
 // versionSource names where a row's current version came from, and describes
 // it in the terms the reader needs: whether they are looking at reality or at
@@ -297,8 +347,8 @@ func (v versionSource) String() string {
 // the source is returned alongside the version rather than left to look the
 // same as the real thing.
 func (s upgradeStep) currentVersion() (string, versionSource) {
-	if s.running != "" {
-		return talosctl.NormalizeVersion(s.running), sourceRunning
+	if s.running() != "" {
+		return talosctl.NormalizeVersion(s.running()), sourceRunning
 	}
 	if tag := talosctl.TagOf(s.from); tag != "" {
 		return tag, sourceInstalled
@@ -315,9 +365,9 @@ func (s upgradeStep) currentVersion() (string, versionSource) {
 // Resolving up front is the point: a fleet of nodes that turn out to disagree
 // about their schematic should be visible in the plan, not discovered halfway
 // through a rolling reboot.
-func planNodeUpgrades(cmd *cobra.Command, sess *cluster.Session, nodes []cluster.Node, edit talosctl.ImageEdit, image string) ([]upgradeStep, error) {
+func planNodeUpgrades(cmd *cobra.Command, sess *cluster.Session, nodes []cluster.Node, edit talosctl.ImageEdit, image string, policy skipPolicy) ([]upgradeStep, error) {
 	ctx := contextOrBackground(cmd)
-	running := runningVersions(cmd, sess.Cluster(), nodes)
+	running := runningState(cmd, sess.Cluster(), nodes)
 	steps := make([]upgradeStep, 0, len(nodes))
 	for _, node := range nodes {
 		target := talosctl.Target{
@@ -325,7 +375,7 @@ func planNodeUpgrades(cmd *cobra.Command, sess *cluster.Session, nodes []cluster
 			Endpoints:   sess.Endpoints(),
 			Nodes:       []string{node.IP},
 		}
-		step := upgradeStep{node: node, running: running[node.Name]}
+		step := upgradeStep{node: node, state: running[node.Name]}
 		// Only read the running platform when it is about to change: it costs
 		// a round trip per node and says nothing useful otherwise.
 		if edit.Platform != "" || image != "" {
@@ -334,6 +384,7 @@ func planNodeUpgrades(cmd *cobra.Command, sess *cluster.Session, nodes []cluster
 
 		if image != "" {
 			step.image = image
+			step.already = policy.alreadyOnTarget(step)
 			steps = append(steps, step)
 			continue
 		}
@@ -346,12 +397,13 @@ func planNodeUpgrades(cmd *cobra.Command, sess *cluster.Session, nodes []cluster
 			return nil, fmt.Errorf("node %s: %w", node.Name, err)
 		}
 		step.from, step.image = current, next
+		step.already = policy.alreadyOnTarget(step)
 		steps = append(steps, step)
 	}
 	return steps, nil
 }
 
-// runningVersions resolves what each node actually runs, keyed by node name.
+// runningState resolves what each node actually runs, keyed by node name.
 //
 // Best effort by design: this is the truth the plan wants, but it lives in the
 // guest cluster and a run must not be blocked by a guest cluster that cannot
@@ -363,13 +415,14 @@ func planNodeUpgrades(cmd *cobra.Command, sess *cluster.Session, nodes []cluster
 // The operator-verified TalosVersionEnforcement condition is the fallback. It
 // is free and truthful but cluster-wide, so it can only speak when every node
 // agrees — which is never the case mid-upgrade, exactly when the per-node read
-// matters most.
-func runningVersions(cmd *cobra.Command, c cluster.Cluster, nodes []cluster.Node) map[string]string {
-	byNode, err := cluster.RunningVersions(contextOrBackground(cmd), c)
+// matters most. It also carries no schematic, so a run resolved from it can
+// report versions but can never skip a node.
+func runningState(cmd *cobra.Command, c cluster.Cluster, nodes []cluster.Node) map[string]cluster.NodeState {
+	byNode, err := cluster.RunningState(contextOrBackground(cmd), c)
 	if err == nil {
 		return byNode
 	}
-	warn(cmd, fmt.Errorf("reading the nodes' running Talos version: %w", err))
+	warn(cmd, fmt.Errorf("reading the nodes' running Talos state: %w", err))
 
 	enforced := cluster.EnforcedVersion(c)
 	if enforced == "" {
@@ -377,9 +430,81 @@ func runningVersions(cmd *cobra.Command, c cluster.Cluster, nodes []cluster.Node
 	}
 	echo(cmd, fmt.Sprintf(
 		"falling back to the operator-verified version for the whole cluster: v%s", enforced))
-	out := make(map[string]string, len(nodes))
+	out := make(map[string]cluster.NodeState, len(nodes))
 	for _, n := range nodes {
-		out[n.Name] = enforced
+		out[n.Name] = cluster.NodeState{Version: enforced}
+	}
+	return out
+}
+
+// skipPolicy decides whether a node already running the target can be left
+// alone, and is deliberately narrow about when it will say so.
+//
+// Skipping is only safe when every part of the target reference can be checked
+// against what the node reports, and a Node object reports exactly two things:
+// its Talos version and its schematic. The registry and the platform it cannot
+// report at all — so an edit that moves either is never skipped, even if the
+// version and schematic happen to match. That is not conservatism for its own
+// sake: --platform decides where Talos reads its config on the next boot, and
+// wrongly skipping it leaves a node Ready with its config source silently gone.
+//
+// --image is excluded for the same reason: it replaces the whole reference, so
+// its registry and platform are whatever the caller typed and neither can be
+// verified against the node.
+type skipPolicy struct {
+	// enabled is false when something unverifiable is being changed, or when
+	// the caller asked for every node to be upgraded regardless.
+	enabled bool
+	// reason says why skipping is off, for the plan to state plainly rather
+	// than leaving a fleet of no-op reboots looking intentional.
+	reason string
+}
+
+func newSkipPolicy(edit talosctl.ImageEdit, image string, force bool) skipPolicy {
+	switch {
+	case force:
+		return skipPolicy{reason: "--force: every node is upgraded, including any already on the target"}
+	case image != "":
+		return skipPolicy{reason: "--image replaces the whole reference, so its registry and platform " +
+			"cannot be checked against what the nodes report"}
+	case edit.Platform != "":
+		return skipPolicy{reason: "--platform changes where Talos reads its config on the next boot, " +
+			"which a node does not report — no node is skipped"}
+	case edit.Registry != "":
+		return skipPolicy{reason: "--registry cannot be checked against what the nodes report"}
+	}
+	return skipPolicy{enabled: true}
+}
+
+// alreadyOnTarget reports whether the node runs precisely what the upgrade
+// would install, so upgrading it would reboot it to arrive where it already is.
+//
+// Both halves must be known and both must match. An unread version or an
+// absent schematic annotation means "cannot tell", and the answer to that is
+// always to upgrade: a node that a half-finished run left behind is exactly the
+// node that fails to answer, and skipping it would strand the one node that
+// needed the command.
+func (p skipPolicy) alreadyOnTarget(s upgradeStep) bool {
+	if !p.enabled {
+		return false
+	}
+	running, schematic := s.state.Version, s.state.Schematic
+	if running == "" || schematic == "" {
+		return false
+	}
+	if talosctl.NormalizeVersion(running) != talosctl.TagOf(s.image) {
+		return false
+	}
+	return schematic == talosctl.SchematicOf(s.image)
+}
+
+// todo returns the steps that still have work, in plan order.
+func todo(plan []upgradeStep) []upgradeStep {
+	out := make([]upgradeStep, 0, len(plan))
+	for _, step := range plan {
+		if !step.already {
+			out = append(out, step)
+		}
 	}
 	return out
 }
@@ -431,14 +556,36 @@ func pinTarget(cmd *cobra.Command, c cluster.Cluster, plan []upgradeStep, noPin 
 	return p, nil
 }
 
-func printUpgradePlan(cmd *cobra.Command, c cluster.Cluster, plan []upgradeStep, stage bool, p pin) {
+func printUpgradePlan(cmd *cobra.Command, c cluster.Cluster, plan []upgradeStep, stage bool, p pin, policy skipPolicy) {
 	w := cmd.ErrOrStderr()
 	effect := "each node reboots into the new version as it is upgraded"
 	if stage {
 		effect = "staged only; each node takes the upgrade on its next reboot"
 	}
-	_, _ = fmt.Fprintf(w, "\n⬆️  Upgrading %d node(s) of %s, one at a time\n", len(plan), c.Describe())
-	_, _ = fmt.Fprintf(w, "   effect: %s\n", effect)
+	// The headline counts the work, not the targets: "upgrading 4 nodes" when
+	// three of them are already there is the claim this whole change exists to
+	// stop making.
+	work := len(todo(plan))
+	skipped := len(plan) - work
+	switch {
+	case work == 0:
+		_, _ = fmt.Fprintf(w, "\n✅ All %d targeted node(s) of %s already run the target\n",
+			len(plan), c.Describe())
+	case skipped > 0:
+		_, _ = fmt.Fprintf(w, "\n⬆️  Upgrading %d of %d node(s) of %s, one at a time\n",
+			work, len(plan), c.Describe())
+	default:
+		_, _ = fmt.Fprintf(w, "\n⬆️  Upgrading %d node(s) of %s, one at a time\n", len(plan), c.Describe())
+	}
+	if work > 0 {
+		_, _ = fmt.Fprintf(w, "   effect: %s\n", effect)
+	}
+	// Why nothing is being skipped is worth a line whenever a node might
+	// otherwise have been: a fleet of no-op reboots should never look
+	// deliberate by omission.
+	if !policy.enabled && policy.reason != "" {
+		_, _ = fmt.Fprintf(w, "   skip:   off — %s\n", policy.reason)
+	}
 
 	// The lineage every node shares, when they share one. Computed once: it
 	// decides both how the rows read and whether the pin can be stated as a
@@ -530,8 +677,8 @@ func printUpgradeRows(w io.Writer, plan []upgradeStep, lineage string) {
 		printCurrentColumn(w, plan)
 		for _, step := range plan {
 			current, _ := step.currentVersion()
-			_, _ = fmt.Fprintf(w, "   • %-28s %-16s %s → %s\n", step.node.Name, step.node.Role,
-				dash(current), dash(talosctl.TagOf(step.image)))
+			_, _ = fmt.Fprintf(w, "   %s %-28s %-16s %s → %s%s\n", bullet(step), step.node.Name,
+				step.node.Role, dash(current), dash(talosctl.TagOf(step.image)), skipNote(step))
 		}
 		return
 	}
@@ -544,23 +691,44 @@ func printUpgradeRows(w io.Writer, plan []upgradeStep, lineage string) {
 		printCurrentColumn(w, plan)
 		for _, step := range plan {
 			current, _ := step.currentVersion()
-			_, _ = fmt.Fprintf(w, "   • %-28s %-16s %s\n", step.node.Name, step.node.Role, dash(current))
+			_, _ = fmt.Fprintf(w, "   %s %-28s %-16s %s%s\n", bullet(step), step.node.Name,
+				step.node.Role, dash(current), skipNote(step))
 		}
 		return
 	}
 	for _, step := range plan {
-		_, _ = fmt.Fprintf(w, "   • %-28s %s\n", step.node.Name, step.node.Role)
+		_, _ = fmt.Fprintf(w, "   %s %-28s %s%s\n", bullet(step), step.node.Name, step.node.Role, skipNote(step))
 		// The running version is not in either reference — an installer image
 		// records what was asked for, not what booted — so it gets its own line
 		// rather than being inferred from the "from" tag.
-		if step.running != "" {
-			_, _ = fmt.Fprintf(w, "       runs  %s\n", talosctl.NormalizeVersion(step.running))
+		if step.running() != "" {
+			_, _ = fmt.Fprintf(w, "       runs  %s\n", talosctl.NormalizeVersion(step.running()))
 		}
 		if step.from != "" {
 			_, _ = fmt.Fprintf(w, "       from  %s\n", step.from)
 		}
 		_, _ = fmt.Fprintf(w, "       to    %s\n", step.image)
 	}
+}
+
+// bullet marks a row by whether it is work. A skipped node reads as done
+// because it is, and giving it the same bullet as the rest would make a plan
+// that touches one node look like a plan that touches five.
+func bullet(s upgradeStep) string {
+	if s.already {
+		return "✓"
+	}
+	return "•"
+}
+
+// skipNote says why a row is not being acted on, on the row itself: a reader
+// scanning a long plan for what it will do should not have to hold a legend in
+// their head.
+func skipNote(s upgradeStep) string {
+	if s.already {
+		return "   already on target, not touched"
+	}
+	return ""
 }
 
 // planLineage returns the installer reference every node shares on both sides
@@ -681,8 +849,8 @@ func currentColumn(plan []upgradeStep) string {
 func printDeclaredDrift(w io.Writer, plan []upgradeStep) {
 	runs, declared, installed := map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}
 	for _, step := range plan {
-		if step.running != "" {
-			runs[talosctl.NormalizeVersion(step.running)] = struct{}{}
+		if step.running() != "" {
+			runs[talosctl.NormalizeVersion(step.running())] = struct{}{}
 		}
 		if v := talosctl.NormalizeVersion(step.node.TalosVersion); v != "" {
 			declared[v] = struct{}{}
@@ -722,8 +890,12 @@ func printDeclaredDrift(w io.Writer, plan []upgradeStep) {
 	// them, and "that is"/"those are" would have to agree with a count that is
 	// decided at run time.
 	_, _ = fmt.Fprintf(w, "   note:   %s %s, but %s.\n", label, baseline, strings.Join(disagree, " and "))
+	// Not "runs ahead": spec.os.imageID does, but machine.install.image is a
+	// fossil of the original install that no upgrade writes back, so it lags —
+	// d-stackops-1010 sat two upgrades past v1.13.5 with its configs still
+	// saying v1.13.5. Direction-neutral is the only wording true of both.
 	_, _ = fmt.Fprintf(w,
-		"           Desired state runs ahead of the nodes; the rows above show %s.\n", tail)
+		"           Desired state does not track what booted; the rows above show %s.\n", tail)
 }
 
 // upgradeFailure is what a failed node left behind, and what is needed to
