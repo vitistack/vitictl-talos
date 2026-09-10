@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,14 @@ const (
 	// does not say otherwise. It exists on every Vitistack cluster.
 	DefaultTunnelNamespace = "viti-center"
 )
+
+// ErrNoTalosConfig reports that talos.yaml is simply not there.
+//
+// It exists so a caller can tell "you have not configured a tunnel" — the
+// normal state for the many people who never open one — apart from "your
+// talos.yaml is there and wrong", which is a real failure and must be
+// reported as one.
+var ErrNoTalosConfig = errors.New("no tunnel clusters configured")
 
 // TunnelCluster is one Talos cluster this plugin can reach only through a pod
 // in its own Kubernetes cluster.
@@ -84,9 +93,8 @@ func TunnelClusters() ([]TunnelCluster, error) {
 	raw, err := os.ReadFile(path) // #nosec G304 -- path is this plugin's own config location
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf(
-				"no tunnel clusters configured — create %s:\n\n%s",
-				path, exampleTalosConfig)
+			return nil, fmt.Errorf("%w — create %s:\n\n%s",
+				ErrNoTalosConfig, path, exampleTalosConfig)
 		}
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
@@ -116,10 +124,18 @@ func TunnelClusters() ([]TunnelCluster, error) {
 		if strings.TrimSpace(c.Namespace) == "" {
 			c.Namespace = DefaultTunnelNamespace
 		}
-		if first, dup := seen[c.Name]; dup {
-			return nil, fmt.Errorf("%s: entries %d and %d are both named %q", path, first, i+1, c.Name)
+		// Both keys, not just the name: FindTunnelCluster matches an entry by
+		// its name *or* its context, so a name that collides with another
+		// entry's context resolves silently to the wrong cluster — and then
+		// fails as x509, blaming the credentials rather than the file. The
+		// first != i+1 guard is for the common entry whose name defaulted to
+		// its own context.
+		for _, key := range []string{c.Name, c.Context} {
+			if first, dup := seen[key]; dup && first != i+1 {
+				return nil, fmt.Errorf("%s: entries %d and %d both answer to %q", path, first, i+1, key)
+			}
+			seen[key] = i + 1
 		}
-		seen[c.Name] = i + 1
 		out = append(out, c)
 	}
 	return out, nil

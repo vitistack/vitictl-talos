@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -114,28 +116,47 @@ code.`,
 				report(fmt.Sprintf("talos clusters (%d found)", len(found)), nil)
 			}
 
-			// Reported but never fatal: most people never open a tunnel, and a
-			// missing talos.yaml is the normal state for them.
-			switch tunnels, err := config.TunnelClusters(); {
-			case err != nil:
-				_, _ = fmt.Fprintf(out, "➖ tunnel clusters: none configured (%s)\n",
-					firstLine(err.Error()))
-			default:
-				for _, tc := range tunnels {
-					if _, statErr := os.Stat(tc.Talosconfig); statErr != nil {
-						report("tunnel cluster "+tc.Name,
-							fmt.Errorf("talosconfig %s is not readable: %w", tc.Talosconfig, statErr))
-						continue
-					}
-					report(fmt.Sprintf("tunnel cluster %s (%s)", tc.Name, tc.Context), nil)
-				}
-			}
+			checkTunnelClusters(out, report)
 
 			if failed {
 				return errConfigIncomplete
 			}
 			return nil
 		},
+	}
+}
+
+// checkTunnelClusters reports the tunnel-cluster leg of "config test",
+// calling report for anything that should make the command fail.
+//
+// A missing talos.yaml is never fatal: most people never open a tunnel, and
+// not having the file is their normal state. A file that is *there* and wrong
+// is the opposite. This is the command someone reaches for when a tunnel will
+// not open, and rendering a YAML error as "none configured" tells them to
+// create a file that already exists and that they have just broken — while
+// exiting 0.
+//
+// It is separated from the RunE so it can be tested without a reachable
+// availability zone, which the checks above it require.
+func checkTunnelClusters(out io.Writer, report func(label string, err error)) {
+	// Printed from the resolved path rather than from the error, whose
+	// example block would be truncated to a dangling colon and would repeat
+	// the reason the line already gives.
+	tpath, _ := config.TalosConfigPath()
+	switch tunnels, err := config.TunnelClusters(); {
+	case errors.Is(err, config.ErrNoTalosConfig):
+		_, _ = fmt.Fprintf(out, "➖ tunnel clusters: none configured (%s)\n", tpath)
+	case err != nil:
+		report("tunnel clusters", err)
+	default:
+		for _, tc := range tunnels {
+			if _, statErr := os.Stat(tc.Talosconfig); statErr != nil {
+				report("tunnel cluster "+tc.Name,
+					fmt.Errorf("talosconfig %s is not readable: %w", tc.Talosconfig, statErr))
+				continue
+			}
+			report(fmt.Sprintf("tunnel cluster %s (%s)", tc.Name, tc.Context), nil)
+		}
 	}
 }
 

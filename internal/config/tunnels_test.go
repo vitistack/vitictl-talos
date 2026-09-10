@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,18 +133,77 @@ func TestTunnelClustersRejectsDuplicateNames(t *testing.T) {
 	}
 }
 
+// FindTunnelCluster matches a name *or* a context, so one entry's name
+// colliding with another's context makes "viti talos tunnel foo" resolve to
+// the wrong cluster — with the wrong credentials, which then fails as x509
+// and blames the talosconfig.
+func TestTunnelClustersRejectsANameThatCollidesWithAnotherContext(t *testing.T) {
+	writeTalosConfig(t, "clusters:\n"+
+		"    - name: foo\n      context: admin@a\n      talosconfig: /a\n"+
+		"    - name: bar\n      context: foo\n      talosconfig: /b\n")
+	_, err := TunnelClusters()
+	if err == nil {
+		t.Fatal("TunnelClusters() accepted a name that is another entry's context, want an error")
+	}
+	for _, want := range []string{"1", "2", `"foo"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// The overwhelmingly common entry names only a context, so its name defaults
+// to that same context. Registering both keys must not make it collide with
+// itself.
+func TestTunnelClustersAcceptsAnEntryWhoseNameIsItsContext(t *testing.T) {
+	writeTalosConfig(t, sampleTalosYAML)
+	if _, err := TunnelClusters(); err != nil {
+		t.Fatalf("TunnelClusters() rejected a defaulted name: %v", err)
+	}
+}
+
 // Nobody has this file until they need a tunnel, so the error has to teach
 // the format rather than just report a missing path.
+//
+// It also has to be recognisable: "config test" reports a missing file as a
+// non-fatal "none configured" and a broken one as a failure, and only the
+// sentinel separates them.
 func TestTunnelClustersExplainsAMissingFile(t *testing.T) {
 	t.Setenv(EnvTalosConfig, filepath.Join(t.TempDir(), "absent.yaml"))
 	_, err := TunnelClusters()
 	if err == nil {
 		t.Fatal("TunnelClusters() succeeded, want an error")
 	}
+	if !errors.Is(err, ErrNoTalosConfig) {
+		t.Errorf("error %v does not wrap ErrNoTalosConfig", err)
+	}
 	for _, want := range []string{"absent.yaml", "clusters:", "talosconfig:"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
+	}
+}
+
+// A talos.yaml that is there and wrong is the opposite of one that is absent:
+// it is a real failure, and must not be mistaken for "you have not configured
+// a tunnel".
+func TestTunnelClustersDistinguishesABrokenFileFromAMissingOne(t *testing.T) {
+	for name, content := range map[string]string{
+		"bad yaml":      "clusters:\n  - context: admin@a\n   talosconfig: /a\n",
+		"no context":    "clusters:\n    - talosconfig: /a\n",
+		"empty file":    "clusters: []\n",
+		"duplicate key": "clusters:\n    - context: admin@a\n    - context: admin@a\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			writeTalosConfig(t, content)
+			_, err := TunnelClusters()
+			if err == nil {
+				t.Fatal("TunnelClusters() succeeded, want an error")
+			}
+			if errors.Is(err, ErrNoTalosConfig) {
+				t.Errorf("error %v is reported as a missing file, but the file is there and wrong", err)
+			}
+		})
 	}
 }
 
