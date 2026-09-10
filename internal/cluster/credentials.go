@@ -93,7 +93,17 @@ func WriteTempTalosconfig(secret *corev1.Secret, contextName string, endpoints [
 		return "", nil, fmt.Errorf("secret %s/%s has no %q entry (not a Talos cluster?)",
 			secret.Namespace, secret.Name, KeyTalosconfig)
 	}
+	return WriteTempTalosconfigBytes(raw, contextName, endpoints)
+}
 
+// WriteTempTalosconfigBytes is WriteTempTalosconfig for credentials that did
+// not come from a Secret.
+//
+// The tunnel command reads a talosconfig from disk — the clusters it reaches
+// are not KubernetesCluster resources, so no management cluster holds their
+// credentials — but needs exactly the same treatment: one renamed context,
+// endpoints replaced, owner-only permissions, cleaned up afterwards.
+func WriteTempTalosconfigBytes(raw []byte, contextName string, endpoints []string) (path string, cleanup func(), err error) {
 	dir, err := os.MkdirTemp("", "viti-talos-*")
 	if err != nil {
 		return "", nil, fmt.Errorf("creating temp dir: %w", err)
@@ -141,7 +151,10 @@ func writeTalosconfigFile(data []byte, contextName string, endpoints []string, p
 	}
 	src := sourceContext(&cfg)
 	if src == nil {
-		return fmt.Errorf("talosconfig has no usable context")
+		return fmt.Errorf(
+			"talosconfig has no usable context — it needs a top-level %q map; " +
+				"a context exported as a bare body (endpoints/ca/crt/key at the top level) will not parse",
+			"contexts:")
 	}
 	if len(endpoints) > 0 {
 		src.Endpoints = dedupeKeepOrder(endpoints)

@@ -137,3 +137,52 @@ func TestSourceContextFallsBackDeterministically(t *testing.T) {
 		t.Error("sourceContext() invented a context for an empty config")
 	}
 }
+
+// The tunnel command has a talosconfig file rather than a Secret, and must
+// rename its context and override its endpoints exactly as the Secret path
+// does — duplicating that logic is how the two drift.
+func TestWriteTempTalosconfigBytesRenamesAndOverrides(t *testing.T) {
+	path, cleanup, err := WriteTempTalosconfigBytes(
+		[]byte(sampleTalosconfig), "pos1-kv-cl01", []string{"127.0.0.1:54417"})
+	if err != nil {
+		t.Fatalf("WriteTempTalosconfigBytes() error: %v", err)
+	}
+	defer cleanup()
+
+	raw, err := os.ReadFile(path) // #nosec G304 -- a path this test just created
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got talosConfig
+	if err := yaml.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Context != "pos1-kv-cl01" {
+		t.Errorf("context = %q, want pos1-kv-cl01", got.Context)
+	}
+	entry := got.Contexts["pos1-kv-cl01"]
+	if entry == nil {
+		t.Fatalf("no context named pos1-kv-cl01 in %v", got.Contexts)
+	}
+	if len(entry.Endpoints) != 1 || entry.Endpoints[0] != "127.0.0.1:54417" {
+		t.Errorf("endpoints = %v, want [127.0.0.1:54417]", entry.Endpoints)
+	}
+	if entry.CA != "Y2E=" {
+		t.Errorf("ca = %q, want it carried through", entry.CA)
+	}
+}
+
+// A talosconfig exported as a bare context body — endpoints/ca/crt/key at the
+// top level with no context:/contexts: keys — parses into an empty struct.
+// This has already cost an afternoon once, so the message has to name the
+// shape rather than say "no usable context".
+func TestWriteTempTalosconfigBytesExplainsABareContextBody(t *testing.T) {
+	bare := "endpoints:\n    - 1.1.1.1\nca: Y2E=\ncrt: Y3J0\nkey: a2V5\n"
+	_, _, err := WriteTempTalosconfigBytes([]byte(bare), "kv", nil)
+	if err == nil {
+		t.Fatal("WriteTempTalosconfigBytes() succeeded on a bare context body, want an error")
+	}
+	if !strings.Contains(err.Error(), "contexts:") {
+		t.Errorf("error %q does not explain the expected shape", err)
+	}
+}
