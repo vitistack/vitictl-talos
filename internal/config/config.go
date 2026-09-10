@@ -1,11 +1,16 @@
 // Package config reads the Vitistack configuration this plugin operates
 // against.
 //
-// Unlike viti-kubevirt, this plugin has no configuration file of its own.
-// Everything it needs is already discoverable: the availability zones come
-// from vitictl's ctl.config.yaml, and a Talos cluster's credentials come from
-// the Secret its own management cluster holds. A second config file would only
-// give the two CLIs something to drift on.
+// Almost everything it needs is already discoverable: the availability zones
+// come from vitictl's ctl.config.yaml, and a Talos cluster's credentials come
+// from the Secret its own management cluster holds. Duplicating either here
+// would only give the two CLIs something to drift on.
+//
+// The exception is talos.yaml (see tunnels.go), which holds what vitictl has
+// no concept of: Talos credentials for clusters that are not
+// KubernetesCluster resources — the management clusters and the KubeVirt
+// hypervisor clusters. Nothing in it is mirrored from vitictl, so there is
+// nothing for the two to disagree about.
 package config
 
 import (
