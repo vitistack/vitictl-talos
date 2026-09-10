@@ -80,6 +80,19 @@ func (t *Topology) NodeIPs(role string) []string {
 	return out
 }
 
+// Describe names the cluster this topology belongs to, for error messages.
+//
+// A topology is not always built from a KubernetesCluster: the tunnel command
+// assembles one from the Kubernetes API, where there is no management-cluster
+// resource to name. Falling back to a neutral phrase keeps those errors
+// readable instead of "cluster <unresolved cluster> has no node X".
+func (t *Topology) Describe() string {
+	if t.Cluster.KC == nil {
+		return "this cluster"
+	}
+	return "cluster " + t.Cluster.Describe()
+}
+
 // Select resolves the nodes a command should act on: those named in wanted
 // (matched on machine name or address) filtered by role, or — when wanted is
 // empty — every node of that role.
@@ -120,8 +133,8 @@ func (t *Topology) Select(wanted []string, role string) ([]Node, error) {
 		}
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("cluster %s has no node %s (have: %s)",
-			t.Cluster.Describe(), strings.Join(missing, ", "), strings.Join(nodeNames(byRole), ", "))
+		return nil, fmt.Errorf("%s has no node %s (have: %s)",
+			t.Describe(), strings.Join(missing, ", "), strings.Join(nodeNames(byRole), ", "))
 	}
 	return withAddress(out)
 }
@@ -418,4 +431,20 @@ func dedupeKeepOrder(in []string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// PickNodeIP returns the first address worth dialling, honouring the IP-family
+// preference.
+//
+// It is exported for callers that resolve a cluster's nodes from somewhere
+// other than the management cluster — the tunnel command reads them from the
+// Kubernetes API — so which addresses count as usable stays decided in one
+// place rather than drifting between two.
+func PickNodeIP(addrs []string, includeIPv6 bool) string {
+	for _, a := range filterIPFamily(addrs, includeIPv6) {
+		if isUsableNodeIP(a) {
+			return a
+		}
+	}
+	return ""
 }
