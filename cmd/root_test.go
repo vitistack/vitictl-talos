@@ -15,7 +15,7 @@ func TestRootCommandTree(t *testing.T) {
 	root := NewRootCmd()
 	want := []string{
 		"clusters", "nodes", "dashboard", "dmesg", "netstat", "memory", "get",
-		"edit", "show", "patch", "upgrade-node", "upgrade-k8s",
+		"edit", "show", "patch", "upgrade-node", "upgrade-k8s", "tunnel",
 		"config", "version", "upgrade",
 	}
 	have := map[string]bool{}

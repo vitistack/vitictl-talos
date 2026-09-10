@@ -99,6 +99,7 @@ func NewRootCmd() *cobra.Command {
 		newPatchCmd(s),
 		newUpgradeNodeCmd(s),
 		newUpgradeK8sCmd(s),
+		newTunnelCmd(s),
 		newConfigCmd(s),
 	)
 	o := selfupgrade.Options{
