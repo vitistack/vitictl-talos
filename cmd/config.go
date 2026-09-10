@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -15,14 +16,20 @@ func newConfigCmd(s *scope) *cobra.Command {
 		Use:     "config",
 		Aliases: []string{"cfg"},
 		Short:   "⚙️  Inspect what this plugin is configured to reach",
-		Long: `viti-talos has no configuration file of its own — deliberately.
+		Long: `viti-talos discovers almost everything it needs.
 
-Everything it needs is already discoverable: the availability zones come from
-vitictl's own ctl.config.yaml ("viti config add"), and each Talos cluster's
-credentials come from the Secret its management cluster holds. A second config
-file would only give the two CLIs something to drift on.
+The availability zones come from vitictl's own ctl.config.yaml ("viti config
+add"), and each Talos cluster's credentials come from the Secret its
+management cluster holds — duplicating either here would only give the two
+CLIs something to drift on.
 
-These subcommands are for finding out what that resolves to when something
+The exception is talos.yaml, beside that file, which names the clusters that
+are not KubernetesCluster resources — the management clusters and the KubeVirt
+hypervisor clusters. Nothing in the management cluster knows their Talos
+credentials, so "viti talos tunnel" is the one thing that has to be told. Its
+nodes are still discovered rather than configured.
+
+These subcommands are for finding out what that all resolves to when something
 does not work.`,
 	}
 	cmd.AddCommand(newConfigPathCmd(), newConfigTestCmd(s))
@@ -41,6 +48,12 @@ func newConfigPathCmd() *cobra.Command {
 			}
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintf(out, "vitistack (viti):  %s\n", path)
+
+			tpath, err := config.TalosConfigPath()
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(out, "tunnel clusters:   %s%s\n", tpath, existsSuffix(tpath))
 			_, err = fmt.Fprintf(out, "talosconfig:       minted per command from each cluster's Secret (never written to ~/.talos/config)\n")
 			return err
 		},
@@ -101,6 +114,23 @@ code.`,
 				report(fmt.Sprintf("talos clusters (%d found)", len(found)), nil)
 			}
 
+			// Reported but never fatal: most people never open a tunnel, and a
+			// missing talos.yaml is the normal state for them.
+			switch tunnels, err := config.TunnelClusters(); {
+			case err != nil:
+				_, _ = fmt.Fprintf(out, "➖ tunnel clusters: none configured (%s)\n",
+					firstLine(err.Error()))
+			default:
+				for _, tc := range tunnels {
+					if _, statErr := os.Stat(tc.Talosconfig); statErr != nil {
+						report("tunnel cluster "+tc.Name,
+							fmt.Errorf("talosconfig %s is not readable: %w", tc.Talosconfig, statErr))
+						continue
+					}
+					report(fmt.Sprintf("tunnel cluster %s (%s)", tc.Name, tc.Context), nil)
+				}
+			}
+
 			if failed {
 				return errConfigIncomplete
 			}
@@ -112,3 +142,13 @@ code.`,
 // errConfigIncomplete makes "config test" exit non-zero without printing a
 // second error underneath the per-check report above.
 var errConfigIncomplete = fmt.Errorf("one or more checks failed")
+
+// existsSuffix marks a configured path that is not there, since "the file you
+// are looking at is absent" is the answer to most questions that reach here.
+func existsSuffix(path string) string {
+	if _, err := os.Stat(path); err != nil {
+		return " (not present)"
+	}
+	return ""
+}
+

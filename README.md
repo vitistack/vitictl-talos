@@ -116,6 +116,7 @@ timeout.
 | **`patch`** | **Apply a machine-config patch across many clusters at once** |
 | `upgrade-node` | Upgrade Talos itself, one node at a time |
 | `upgrade-k8s` | Upgrade Kubernetes on one cluster |
+| `tunnel` | Reach a Talos API that is not routable from here, through a pod |
 | `config` / `version` / `upgrade` | The plugin's own housekeeping |
 
 Leave the cluster name out of any single-cluster command and a fuzzy-searchable
@@ -128,6 +129,89 @@ Anything after a `--` is handed to `talosctl` unchanged:
 viti talos dmesg my-cluster -- --follow --tail
 viti talos netstat my-cluster -- --listening --programs
 ```
+
+## Reaching a cluster the Talos API cannot see
+
+Some clusters answer on the Kubernetes API but not on tcp/50000 from where you
+are sitting. The Vitistack management clusters and the KubeVirt hypervisor
+clusters are the usual case: `viti talos nodes <cluster> --probe` shows ❌ on
+every node, while `kubectl` against the same cluster works fine.
+
+`viti talos tunnel` closes that gap. It runs a small socat pod inside the
+cluster's own Kubernetes cluster, pointed at one control-plane node's Talos
+API, and port-forwards it to localhost. apid on that endpoint proxies to every
+other node, so one control plane reaches all of them — and TLS verification is
+unaffected, because the certificate is checked against the cluster's CA rather
+than against the address you dialled.
+
+These clusters are not `KubernetesCluster` resources, so nothing in the
+management cluster knows their Talos credentials. That one fact is what has to
+be configured, in `talos.yaml` beside vitictl's own config — `viti talos
+config path` prints where:
+
+```yaml
+clusters:
+  - context: admin@pos1-kv-cl01
+    talosconfig: ~/.talos/kvosltalos
+  - context: admin@bgo-virt-001
+    talosconfig: ~/.talos/kvbgotalos
+  - context: admin@ptr1-kv-cl01
+    talosconfig: ~/.talos/ktrdtalos
+```
+
+`name` defaults to the context, `namespace` to `viti-center`, and `kubeconfig`
+to `$KUBECONFIG` / `~/.kube/config`. Nodes are **not** configured: they are
+read from the Kubernetes API on every run, so a rebuilt cluster needs no edit
+here.
+
+Run one command through the tunnel and tear it down:
+
+```console
+$ viti talos tunnel pos1-kv-cl01 -- get members
+▶ pos1-kv-cl01 — tunnel via viti-center/talos-tunnel-3f9a2c1d → 100.64.0.4:50000
+▶ ready on 127.0.0.1:54417
+NODE          NAMESPACE   TYPE     ID                    VERSION   HOSTNAME
+100.64.0.4    cluster     Member   pos1-kv-cl01-ctp01    1         pos1-kv-cl01-ctp01
+...
+```
+
+Or hold it open and drive `talosctl` yourself:
+
+```console
+$ viti talos tunnel pos1-kv-cl01
+▶ pos1-kv-cl01 — tunnel via viti-center/talos-tunnel-3f9a2c1d → 100.64.0.4:50000
+▶ ready on 127.0.0.1:54417
+
+  export TALOSCONFIG=/var/folders/…/viti-talos-8kd/talosconfig
+  talosctl -n 100.64.0.4,100.64.0.5,100.64.0.6 <command>
+
+(Ctrl-C to tear down)
+```
+
+No `-e` in that line: the temporary talosconfig already names the local
+endpoint. The `-n` list is whatever `--node` and `--role` selected, so
+`--role controlplane` narrows what is printed as well as what is run.
+
+The local port is a free one by default, because 50000 is so often already
+bound — by a `talosctl` of your own, or by a second tunnel. `--local-port
+50000` pins it when you want the familiar number.
+
+### Cleaning up
+
+The pod is deleted when the command exits, including on Ctrl-C and including
+when a step fails partway through. It also carries an `activeDeadlineSeconds`
+(8 hours, `--deadline`) so that even a `kill -9` — the one exit no handler can
+catch — cannot leave one running indefinitely.
+
+If you do find an orphan, every tunnel pod is labelled:
+
+```sh
+kubectl -n viti-center delete pod -l app.kubernetes.io/managed-by=viti-talos
+```
+
+`viti talos tunnel` prints that line itself when it finds a tunnel pod already
+in the namespace. It does not delete them for you — a colleague may be holding
+one open.
 
 ## Changing machine configs across the fleet
 
