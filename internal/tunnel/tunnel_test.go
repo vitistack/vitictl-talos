@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"strings"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,6 +55,25 @@ func TestCloseIsIdempotentOnAnUnopenedTunnel(t *testing.T) {
 	tun = &Tunnel{}
 	tun.Close()
 	tun.Close()
+}
+
+// Close is reached from a defer, a signal handler, and the defer that runs
+// after the signal — those are separate goroutines. This exercises exactly
+// that: many callers racing to close the same tunnel. Run with -race; before
+// the sync.Once fix, two goroutines could both observe stop != nil and both
+// close() it, panicking with "close of closed channel".
+func TestCloseIsSafeForConcurrentCallers(t *testing.T) {
+	tun := &Tunnel{stop: make(chan struct{})}
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tun.Close()
+		}()
+	}
+	wg.Wait()
 }
 
 func TestOptionsApplyDefaults(t *testing.T) {

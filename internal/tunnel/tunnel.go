@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -98,6 +99,12 @@ type Tunnel struct {
 	clientset kubernetes.Interface
 	stop      chan struct{}
 	warn      func(error)
+
+	// closeOnce guards the body of Close, which is reached from a defer, a
+	// signal handler, and the defer that runs after the signal — three
+	// goroutines is common, not hypothetical. Without it, two concurrent
+	// callers can both observe stop != nil and both close() it, panicking.
+	closeOnce sync.Once
 }
 
 // Open creates the tunnel pod and brings its Talos API to localhost.
@@ -159,13 +166,19 @@ func Open(ctx context.Context, o Options) (*Tunnel, error) {
 	return t, nil
 }
 
-// Close stops the port-forward and deletes the pod. It is idempotent, and safe
-// on a nil receiver, because it is reached from a defer, from a signal, and
-// from the defer that runs after the signal.
+// Close stops the port-forward and deletes the pod. It is idempotent, safe on
+// a nil receiver, and safe for concurrent callers, because it is reached from
+// a defer, from a signal, and from the defer that runs after the signal —
+// those are separate goroutines, not separate sequential calls.
 func (t *Tunnel) Close() {
 	if t == nil {
 		return
 	}
+	t.closeOnce.Do(t.close)
+}
+
+// close is Close's body, run at most once via closeOnce.
+func (t *Tunnel) close() {
 	if t.stop != nil {
 		close(t.stop)
 		t.stop = nil
@@ -210,11 +223,16 @@ func (t *Tunnel) waitReady(ctx context.Context, timeout time.Duration) error {
 	if err == nil {
 		return nil
 	}
-	if last == nil {
+	// wait.Interrupted is true exactly for the timeout/cancellation cases —
+	// the loop ran out of time or the caller's context was cancelled — and
+	// false when the condition itself errored (a failed Get: a 403, a torn
+	// connection). Discriminating on that, not on whether a Get ever
+	// succeeded, is what keeps an API error from being reported as a timeout.
+	if !wait.Interrupted(err) {
 		return fmt.Errorf("waiting for tunnel pod %s/%s: %w", t.Namespace, t.PodName, err)
 	}
-	return fmt.Errorf("tunnel pod %s/%s did not become ready within %s: %s",
-		t.Namespace, t.PodName, timeout, NotReadyReason(last))
+	return fmt.Errorf("tunnel pod %s/%s did not become ready within %s (%w): %s",
+		t.Namespace, t.PodName, timeout, err, NotReadyReason(last))
 }
 
 // forward brings the pod's Talos API port to localhost.
