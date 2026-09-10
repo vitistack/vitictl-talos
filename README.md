@@ -52,10 +52,11 @@ viti talos config test
 ✅ talos clusters (173 found)
 ```
 
-## No login, no config file
+## Almost nothing to configure
 
-There is nothing to configure. The plugin reads viti's own availability zones
-(`viti config add`) and takes everything else from the management cluster:
+Almost everything here is discovered rather than configured. The plugin reads
+viti's own availability zones (`viti config add`) and takes each Talos
+cluster's credentials from its management cluster's Secret:
 
 ```
 KubernetesCluster  spec.data.clusterId
@@ -64,6 +65,12 @@ KubernetesCluster  spec.data.clusterId
   ├─► ControlPlaneVirtualSharedIP   status.poolMembers ──► --endpoints
   └─► Machine <clusterId>-ctp*/-wrk*  node IPs ──────────► --nodes
 ```
+
+The exception is `talos.yaml`, which names the clusters that are not
+`KubernetesCluster` resources — the management clusters and the KubeVirt
+hypervisor clusters — so nothing above can discover their Talos credentials.
+Even for those, nodes are still discovered rather than configured: see
+[Reaching a cluster the Talos API cannot see](#reaching-a-cluster-the-talos-api-cannot-see).
 
 Two consequences worth knowing:
 
