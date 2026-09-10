@@ -1,6 +1,10 @@
 package cmd
 
 import (
+	"context"
+	"errors"
+	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -86,6 +90,33 @@ func TestCredentialHintNamesTheFileAndTheCluster(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("credentialHint() = %q, does not mention %q", got, want)
 		}
+	}
+}
+
+// Ctrl-C reaches this command as three different failures, none of which is
+// a broken tunnel: the child talosctl's "signal: interrupt" (dressed up with
+// a hint about a certificate mismatch that did not happen), a readiness poll
+// that ran out of context, and a bare context.Canceled from the port-forward
+// setup. runTunnel translates all of them at once, so cancelling unwinds
+// without printing an error.
+func TestRunTunnelReportsACancelledContextAsCancelled(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(config.EnvVitiConfig, filepath.Join(dir, "ctl.config.yaml"))
+	t.Setenv(config.EnvTalosConfig, filepath.Join(dir, "talos.yaml"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+
+	// Uncancelled, this would fail with "no tunnel clusters configured"
+	// before ever reaching a cluster. The point is that the cancellation wins
+	// over whatever the unwind happens to be carrying.
+	err := runTunnel(cmd, &scope{}, &nodeSelector{}, &tunnelOpts{}, []string{"whatever"})
+	if !errors.Is(err, errCancelled) {
+		t.Errorf("runTunnel() = %v, want errCancelled", err)
 	}
 }
 

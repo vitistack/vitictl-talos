@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -43,6 +44,13 @@ const (
 	pollInterval = 500 * time.Millisecond
 )
 
+// ErrLostConnection reports a port-forward that ended without an error of its
+// own. client-go's forwarder returns nil both when it is stopped deliberately
+// and when the stream is lost — pod evicted, node drained,
+// activeDeadlineSeconds reached — so the second case needs an error of its
+// own, or a tunnel that died would look like one that was never open.
+var ErrLostConnection = errors.New("the connection to the tunnel pod was lost")
+
 // Options configures one tunnel.
 type Options struct {
 	Cluster     config.TunnelCluster
@@ -59,7 +67,9 @@ type Options struct {
 	Err io.Writer
 }
 
-func (o *Options) applyDefaults() {
+// applyDefaults fills in what was left unset and rejects a combination that
+// cannot produce a working tunnel.
+func (o *Options) applyDefaults() error {
 	if strings.TrimSpace(o.Image) == "" {
 		o.Image = DefaultImage
 	}
@@ -75,6 +85,21 @@ func (o *Options) applyDefaults() {
 	if o.Err == nil {
 		o.Err = io.Discard
 	}
+	// activeDeadlineSeconds below the readiness wait guarantees the pod is
+	// killed before it can carry anything, and the failure it produces is a
+	// readiness timeout that says nothing about the deadline that caused it.
+	if o.Deadline < o.Timeout {
+		return fmt.Errorf(
+			"deadline %s is shorter than timeout %s: the tunnel pod would be killed before it was ready",
+			o.Deadline, o.Timeout)
+	}
+	// activeDeadlineSeconds is whole seconds, so anything under one rounds
+	// down to zero and is refused by the apiserver's own validation — a
+	// message about a field this tool set, not about the flag that set it.
+	if int64(o.Deadline.Seconds()) == 0 {
+		return fmt.Errorf("deadline %s rounds down to zero seconds; use at least 1s", o.Deadline)
+	}
+	return nil
 }
 
 // Tunnel is an open path to a cluster's Talos API: a socat pod inside the
@@ -100,6 +125,21 @@ type Tunnel struct {
 	stop      chan struct{}
 	warn      func(error)
 
+	// done closes when the port-forwarder returns and fwdErr says why, so a
+	// tunnel that dies on its own can be selected on. Without that the
+	// command sits on <-ctx.Done() still advertising a local port that
+	// stopped accepting, and the next talosctl gets "connection refused"
+	// from a CLI claiming the tunnel is up.
+	done chan struct{}
+
+	// mu guards fwdErr and closing, which the forwarder goroutine writes and
+	// Err reads.
+	mu sync.Mutex
+	// closing records that this process asked for the teardown, so the nil
+	// the forwarder then returns is not reported as a failure.
+	closing bool
+	fwdErr  error
+
 	// closeOnce guards the body of Close, which is reached from a defer, a
 	// signal handler, and the defer that runs after the signal — three
 	// goroutines is common, not hypothetical. Without it, two concurrent
@@ -107,12 +147,52 @@ type Tunnel struct {
 	closeOnce sync.Once
 }
 
+// Done closes when the port-forward stops carrying traffic, whether the pod
+// died, the deadline fired, or Close tore it down.
+//
+// A tunnel that was never forwarded returns nil, which blocks forever in a
+// select: it has nothing that can stop.
+func (t *Tunnel) Done() <-chan struct{} {
+	if t == nil {
+		return nil
+	}
+	return t.done
+}
+
+// Err reports why the port-forward stopped. It is meaningful once Done has
+// closed, and is nil for a teardown this process asked for.
+func (t *Tunnel) Err() error {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.fwdErr
+}
+
+// setForwardErr records why the forwarder returned, translating the two ways
+// it can say nothing: a teardown this process asked for is not a failure, and
+// a nil from anything else means the stream was lost.
+func (t *Tunnel) setForwardErr(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closing {
+		return
+	}
+	if err == nil {
+		err = ErrLostConnection
+	}
+	t.fwdErr = err
+}
+
 // Open creates the tunnel pod and brings its Talos API to localhost.
 //
 // Every step that can fail tears down what the steps before it created, so a
 // failure never leaves a pod behind.
 func Open(ctx context.Context, o Options) (*Tunnel, error) {
-	o.applyDefaults()
+	if err := o.applyDefaults(); err != nil {
+		return nil, fmt.Errorf("%s: %w", o.Cluster.Name, err)
+	}
 
 	rc, err := kube.RESTConfig(o.Cluster.Kubeconfig, o.Cluster.Context)
 	if err != nil {
@@ -159,7 +239,7 @@ func Open(ctx context.Context, o Options) (*Tunnel, error) {
 		t.Close()
 		return nil, err
 	}
-	if err := t.forward(ctx, rc, cs, o); err != nil {
+	if err := t.forward(ctx, rc, o); err != nil {
 		t.Close()
 		return nil, err
 	}
@@ -179,6 +259,13 @@ func (t *Tunnel) Close() {
 
 // close is Close's body, run at most once via closeOnce.
 func (t *Tunnel) close() {
+	// Recorded before the forwarder is stopped, so the nil it returns on the
+	// way out is attributed to this teardown rather than reported as a tunnel
+	// that died: Done fires either way, and only Err can tell them apart.
+	t.mu.Lock()
+	t.closing = true
+	t.mu.Unlock()
+
 	if t.stop != nil {
 		close(t.stop)
 		t.stop = nil
@@ -231,17 +318,25 @@ func (t *Tunnel) waitReady(ctx context.Context, timeout time.Duration) error {
 	if !wait.Interrupted(err) {
 		return fmt.Errorf("waiting for tunnel pod %s/%s: %w", t.Namespace, t.PodName, err)
 	}
+	// wait.Interrupted is true for a cancelled caller too, and the poll runs
+	// on its own derived deadline — so only the caller's context being
+	// cancelled distinguishes Ctrl-C from a pod that really was too slow.
+	// Reporting the first as the second sends the reader hunting a cluster
+	// problem they do not have.
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return fmt.Errorf("waiting for tunnel pod %s/%s: %w", t.Namespace, t.PodName, ctx.Err())
+	}
 	return fmt.Errorf("tunnel pod %s/%s did not become ready within %s (%w): %s",
 		t.Namespace, t.PodName, timeout, err, NotReadyReason(last))
 }
 
 // forward brings the pod's Talos API port to localhost.
-func (t *Tunnel) forward(ctx context.Context, rc *rest.Config, cs *kubernetes.Clientset, o Options) error {
+func (t *Tunnel) forward(ctx context.Context, rc *rest.Config, o Options) error {
 	rt, upgrader, err := spdy.RoundTripperFor(rc)
 	if err != nil {
 		return fmt.Errorf("building the port-forward transport: %w", err)
 	}
-	u := cs.CoreV1().RESTClient().Post().
+	u := t.clientset.CoreV1().RESTClient().Post().
 		Resource("pods").Namespace(t.Namespace).Name(t.PodName).
 		SubResource("portforward").URL()
 	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: rt}, http.MethodPost, u)
@@ -253,15 +348,20 @@ func (t *Tunnel) forward(ctx context.Context, rc *rest.Config, cs *kubernetes.Cl
 	if err != nil {
 		return fmt.Errorf("preparing the port-forward: %w", err)
 	}
-	errCh := make(chan error, 1)
-	go func() { errCh <- pf.ForwardPorts() }()
+	// done outlives this function: ForwardPorts blocks for the life of the
+	// tunnel, and Done is what lets the caller notice when it stops.
+	t.done = make(chan struct{})
+	go func() {
+		t.setForwardErr(pf.ForwardPorts())
+		close(t.done)
+	}()
 
 	select {
 	case <-ready:
-	case err := <-errCh:
-		return fmt.Errorf("port-forward to %s/%s failed: %w", t.Namespace, t.PodName, err)
+	case <-t.done:
+		return fmt.Errorf("port-forward to %s/%s failed: %w", t.Namespace, t.PodName, t.Err())
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("port-forward to %s/%s: %w", t.Namespace, t.PodName, ctx.Err())
 	}
 
 	ports, err := pf.GetPorts()

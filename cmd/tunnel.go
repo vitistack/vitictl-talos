@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -97,7 +98,30 @@ func newTunnelCmd(s *scope) *cobra.Command {
 	return cmd
 }
 
+// runTunnel owns the signal context and translates a cancellation into
+// errCancelled.
+//
+// Ctrl-C reaches this command as three different failures — the child
+// talosctl's "signal: interrupt", a readiness poll that ran out of context,
+// and a bare context.Canceled from the port-forward setup — and each one
+// would otherwise be printed as if the tunnel were broken, one of them under
+// a hint about a certificate mismatch that did not happen. Translating once,
+// here, keeps that judgement in a single place: cancelling is a decision, not
+// a failure, so it unwinds without printing (see errCancelled).
 func runTunnel(cmd *cobra.Command, s *scope, n *nodeSelector, o *tunnelOpts, args []string) error {
+	// Ctrl-C must unwind through the deferred Close rather than killing the
+	// process, which would leave the pod running in someone's cluster.
+	ctx, stopSignals := signal.NotifyContext(contextOrBackground(cmd), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	err := openTunnel(ctx, cmd, s, n, o, args)
+	if ctx.Err() != nil {
+		return errCancelled
+	}
+	return err
+}
+
+func openTunnel(ctx context.Context, cmd *cobra.Command, s *scope, n *nodeSelector, o *tunnelOpts, args []string) error {
 	name, passthrough, err := splitArgs(cmd, args)
 	if err != nil {
 		return err
@@ -120,11 +144,6 @@ func runTunnel(cmd *cobra.Command, s *scope, n *nodeSelector, o *tunnelOpts, arg
 	if err != nil {
 		return fmt.Errorf("reading the talosconfig configured for %s: %w", tc.Name, err)
 	}
-
-	// Ctrl-C must unwind through the deferred Close rather than killing the
-	// process, which would leave the pod running in someone's cluster.
-	ctx, stopSignals := signal.NotifyContext(contextOrBackground(cmd), os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
 
 	tun, err := tunnel.Open(ctx, tunnel.Options{
 		Cluster:     tc,
@@ -165,15 +184,31 @@ func runTunnel(cmd *cobra.Command, s *scope, n *nodeSelector, o *tunnelOpts, arg
 		Nodes:     nodeAddresses(nodes),
 	}
 	if len(passthrough) > 0 {
-		if runErr := talosctl.Run(ctx, streams(cmd), target, passthrough[0], passthrough[1:]...); runErr != nil {
-			return fmt.Errorf("%w\n%s", runErr, credentialHint(tc))
+		runErr := talosctl.Run(ctx, streams(cmd), target, passthrough[0], passthrough[1:]...)
+		if runErr == nil {
+			return nil
 		}
-		return nil
+		// A tunnel that died under a long-running command — "-- dmesg
+		// --follow" outliving the pod — is the real cause, and talosctl's
+		// exit code carries no trace of it. When that is what happened, say
+		// so instead of guessing at credentials.
+		if tunErr := tun.Err(); tunErr != nil {
+			return fmt.Errorf("%w\n   the tunnel to %s stopped first: %v", runErr, tc.Name, tunErr)
+		}
+		return fmt.Errorf("%w\n%s", runErr, credentialHint(tc))
 	}
 
 	_, _ = fmt.Fprint(cmd.ErrOrStderr(), tunnelUsage(path, nodes))
-	<-ctx.Done()
-	echo(cmd, "tearing down")
+	select {
+	case <-ctx.Done():
+		echo(cmd, "tearing down")
+	case <-tun.Done():
+		// The forwarder stopping is not something the user asked for, so it
+		// has to be reported: otherwise the command keeps advertising a local
+		// port that stopped accepting, and the next talosctl fails with a
+		// bare "connection refused".
+		return fmt.Errorf("the tunnel to %s stopped: %w", tc.Name, tun.Err())
+	}
 	return nil
 }
 
@@ -219,6 +254,11 @@ func tunnelUsage(talosconfig string, nodes []cluster.Node) string {
 }
 
 // selectTunnelCluster resolves the configured cluster to open a tunnel to.
+//
+// Deliberately parallel to selectCluster/pickCluster in select.go, over
+// config.TunnelCluster instead of cluster.Cluster: tunnel clusters come from
+// talos.yaml rather than from the availability zones, so they cannot share
+// that code. Anyone changing how a cluster is picked has two sites to change.
 func selectTunnelCluster(cmd *cobra.Command, name string) (config.TunnelCluster, error) {
 	clusters, err := config.TunnelClusters()
 	if err != nil {
