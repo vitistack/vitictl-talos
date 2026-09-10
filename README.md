@@ -147,9 +147,12 @@ every node, while `kubectl` against the same cluster works fine.
 `viti talos tunnel` closes that gap. It runs a small socat pod inside the
 cluster's own Kubernetes cluster, pointed at one control-plane node's Talos
 API, and port-forwards it to localhost. apid on that endpoint proxies to every
-other node, so one control plane reaches all of them — and TLS verification is
-unaffected, because the certificate is checked against the cluster's CA rather
-than against the address you dialled.
+other node, so one control plane reaches all of them — with TLS verification
+left on. Dialling `127.0.0.1` still has to match the certificate, and it does
+because Talos issues its apid certificates with the loopback addresses among
+their SANs. That is a fact about Talos, not a general property of TLS: the
+same trick against a service whose certificate lacks loopback SANs would fail
+verification, as it should.
 
 These clusters are not `KubernetesCluster` resources, so nothing in the
 management cluster knows their Talos credentials. That one fact is what has to

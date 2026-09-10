@@ -20,7 +20,10 @@ The manual workaround, used successfully on all three hypervisor clusters: a
 socat pod inside the target Kubernetes cluster forwards to one control-plane
 node's Talos API, `kubectl port-forward` brings it to localhost, and
 `talosctl -e 127.0.0.1 -n <node-ip>` works with normal TLS verification —
-apid on the endpoint proxies to any `-n` node.
+apid on the endpoint proxies to any `-n` node. The dialled address is still
+checked against the certificate; it passes because Talos puts the loopback
+addresses in its apid certificates' SANs. That is a property of Talos, not of
+TLS, and it is the only reason the loopback endpoint verifies.
 
 This spec makes that one command.
 
