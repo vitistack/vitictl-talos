@@ -152,7 +152,7 @@ func writeTalosconfigFile(data []byte, contextName string, endpoints []string, p
 	src := sourceContext(&cfg)
 	if src == nil {
 		return fmt.Errorf(
-			"talosconfig has no usable context — it needs a top-level %q map; " +
+			"talosconfig has no usable context — it needs a top-level %q map; "+
 				"a context exported as a bare body (endpoints/ca/crt/key at the top level) will not parse",
 			"contexts:")
 	}

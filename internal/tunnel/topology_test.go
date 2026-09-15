@@ -107,11 +107,11 @@ func TestNodesFromKeepsNodesWithNoAddress(t *testing.T) {
 
 func TestTalosVersionFromOSImage(t *testing.T) {
 	for in, want := range map[string]string{
-		"Talos (v1.13.6)":              "v1.13.6",
-		"  Talos (v1.13.6)  ":          "v1.13.6",
-		"Ubuntu 24.04.1 LTS":           "",
-		"":                             "",
-		"Talos v1.13.6":                "",
+		"Talos (v1.13.6)":     "v1.13.6",
+		"  Talos (v1.13.6)  ": "v1.13.6",
+		"Ubuntu 24.04.1 LTS":  "",
+		"":                    "",
+		"Talos v1.13.6":       "",
 	} {
 		if got := TalosVersionFromOSImage(in); got != want {
 			t.Errorf("TalosVersionFromOSImage(%q) = %q, want %q", in, got, want)

@@ -172,4 +172,3 @@ func existsSuffix(path string) string {
 	}
 	return ""
 }
-
