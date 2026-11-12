@@ -42,6 +42,12 @@ const (
 
 	// pollInterval is how often the pod is checked while waiting for Ready.
 	pollInterval = 500 * time.Millisecond
+	// podWatchInterval is how often an open tunnel checks that its pod still
+	// runs. A pod that ends — its deadline, a delete, an eviction — does not
+	// make the port-forward return, so this check is what notices.
+	podWatchInterval = 5 * time.Second
+	// podWatchTimeout bounds each of those checks.
+	podWatchTimeout = 10 * time.Second
 )
 
 // ErrLostConnection reports a port-forward that ended without an error of its
@@ -50,6 +56,12 @@ const (
 // activeDeadlineSeconds reached — so the second case needs an error of its
 // own, or a tunnel that died would look like one that was never open.
 var ErrLostConnection = errors.New("the connection to the tunnel pod was lost")
+
+// ErrPodEnded reports a tunnel whose pod stopped running while the tunnel was
+// open: it reached its deadline, was deleted, or failed. The port-forward
+// stays open in that case, so without it the command would keep advertising
+// a local port that no longer leads anywhere.
+var ErrPodEnded = errors.New("the tunnel pod ended")
 
 // Options configures one tunnel.
 type Options struct {
@@ -125,6 +137,13 @@ type Tunnel struct {
 	stop      chan struct{}
 	warn      func(error)
 
+	// stopOnce closes stop exactly once: Close and the pod watcher can both
+	// want the forwarder stopped.
+	stopOnce sync.Once
+	// watchEvery is the pod check interval; podWatchInterval unless a test
+	// sets it.
+	watchEvery time.Duration
+
 	// done closes when the port-forwarder returns and fwdErr says why, so a
 	// tunnel that dies on its own can be selected on. Without that the
 	// command sits on <-ctx.Done() still advertising a local port that
@@ -139,6 +158,9 @@ type Tunnel struct {
 	// the forwarder then returns is not reported as a failure.
 	closing bool
 	fwdErr  error
+	// podErr is set by the pod watcher when the pod ended, and is what Err
+	// reports once the forwarder it stopped returns.
+	podErr error
 
 	// closeOnce guards the body of Close, which is reached from a defer, a
 	// signal handler, and the defer that runs after the signal — three
@@ -179,10 +201,92 @@ func (t *Tunnel) setForwardErr(err error) {
 	if t.closing {
 		return
 	}
+	if t.podErr != nil {
+		t.fwdErr = t.podErr
+		return
+	}
 	if err == nil {
 		err = ErrLostConnection
 	}
 	t.fwdErr = err
+}
+
+// stopForwarder stops the port-forward. Safe to call more than once and from
+// more than one goroutine.
+func (t *Tunnel) stopForwarder() {
+	if t.stop == nil {
+		return
+	}
+	t.stopOnce.Do(func() { close(t.stop) })
+}
+
+// watchPod checks the tunnel pod until the forwarder stops, and stops the
+// forwarder itself when the pod has ended. cs is passed in, not read from t,
+// because close clears t.clientset while this may still be running.
+//
+// A failed check is not an ended pod: an API hiccup must not drop a working
+// tunnel, so only a pod that is gone, being deleted, or in a final phase ends
+// it.
+func (t *Tunnel) watchPod(cs kubernetes.Interface) {
+	every := t.watchEvery
+	if every <= 0 {
+		every = podWatchInterval
+	}
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-tick.C:
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), podWatchTimeout)
+		p, err := cs.CoreV1().Pods(t.Namespace).Get(ctx, t.PodName, metav1.GetOptions{})
+		cancel()
+		var reason string
+		switch {
+		case apierrors.IsNotFound(err):
+			reason = "it was deleted"
+		case err != nil:
+			continue
+		default:
+			why, ended := podEnded(p)
+			if !ended {
+				continue
+			}
+			reason = why
+		}
+		t.mu.Lock()
+		if !t.closing {
+			t.podErr = fmt.Errorf("%w (%s/%s): %s", ErrPodEnded, t.Namespace, t.PodName, reason)
+		}
+		t.mu.Unlock()
+		t.stopForwarder()
+		return
+	}
+}
+
+// podEnded says whether the pod can no longer carry the tunnel, and why.
+func podEnded(p *corev1.Pod) (string, bool) {
+	if p.DeletionTimestamp != nil {
+		return "it is being deleted", true
+	}
+	switch p.Status.Phase {
+	case corev1.PodFailed, corev1.PodSucceeded:
+	default:
+		return "", false
+	}
+	why := "phase " + string(p.Status.Phase)
+	if p.Status.Reason != "" {
+		why = p.Status.Reason
+	}
+	if p.Status.Reason == "DeadlineExceeded" {
+		why += ", it reached its --deadline"
+	}
+	if p.Status.Message != "" {
+		why += " (" + p.Status.Message + ")"
+	}
+	return why, true
 }
 
 // Open creates the tunnel pod and brings its Talos API to localhost.
@@ -266,10 +370,7 @@ func (t *Tunnel) close() {
 	t.closing = true
 	t.mu.Unlock()
 
-	if t.stop != nil {
-		close(t.stop)
-		t.stop = nil
-	}
+	t.stopForwarder()
 	if t.clientset == nil || t.PodName == "" {
 		return
 	}
@@ -372,6 +473,7 @@ func (t *Tunnel) forward(ctx context.Context, rc *rest.Config, o Options) error 
 		return fmt.Errorf("port-forward to %s/%s bound no port", t.Namespace, t.PodName)
 	}
 	t.LocalAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(int(ports[0].Local)))
+	go t.watchPod(t.clientset)
 	return nil
 }
 

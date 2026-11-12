@@ -28,8 +28,9 @@ claims only a live run can settle.
   belongs in the checklist.
 - **`apid` on the chosen control plane proxies `-n` to workers on their
   InternalIPs.** Assumed throughout; demonstrated for control planes only.
-- **A dying tunnel is reported.** `Tunnel.Done()` by construction only fires
-  when a live pod dies under a live forwarder.
+- ~~**A dying tunnel is reported.**~~ It was not: a pod that reached its
+  deadline left the forwarder open. Fixed by the pod watcher in `tunnel.go`
+  and verified live with `--deadline 1m` (2026-11-12).
 
 ## Known behaviour, accepted
 
