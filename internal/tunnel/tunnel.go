@@ -220,14 +220,15 @@ func (t *Tunnel) stopForwarder() {
 	t.stopOnce.Do(func() { close(t.stop) })
 }
 
-// watchPod checks the tunnel pod until the forwarder stops, and stops the
-// forwarder itself when the pod has ended. cs is passed in, not read from t,
-// because close clears t.clientset while this may still be running.
+// watchPod checks the tunnel pod until the forwarder stops or ctx is done,
+// and stops the forwarder itself when the pod has ended. cs is passed in, not
+// read from t, because close clears t.clientset while this may still be
+// running.
 //
 // A failed check is not an ended pod: an API hiccup must not drop a working
 // tunnel, so only a pod that is gone, being deleted, or in a final phase ends
 // it.
-func (t *Tunnel) watchPod(cs kubernetes.Interface) {
+func (t *Tunnel) watchPod(ctx context.Context, cs kubernetes.Interface) {
 	every := t.watchEvery
 	if every <= 0 {
 		every = podWatchInterval
@@ -238,10 +239,12 @@ func (t *Tunnel) watchPod(cs kubernetes.Interface) {
 		select {
 		case <-t.done:
 			return
+		case <-ctx.Done():
+			return
 		case <-tick.C:
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), podWatchTimeout)
-		p, err := cs.CoreV1().Pods(t.Namespace).Get(ctx, t.PodName, metav1.GetOptions{})
+		getCtx, cancel := context.WithTimeout(ctx, podWatchTimeout)
+		p, err := cs.CoreV1().Pods(t.Namespace).Get(getCtx, t.PodName, metav1.GetOptions{})
 		cancel()
 		var reason string
 		switch {
@@ -473,7 +476,7 @@ func (t *Tunnel) forward(ctx context.Context, rc *rest.Config, o Options) error 
 		return fmt.Errorf("port-forward to %s/%s bound no port", t.Namespace, t.PodName)
 	}
 	t.LocalAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(int(ports[0].Local)))
-	go t.watchPod(t.clientset)
+	go t.watchPod(ctx, t.clientset)
 	return nil
 }
 

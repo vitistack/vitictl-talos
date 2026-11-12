@@ -33,7 +33,7 @@ func watchedTunnel(cs *fake.Clientset) (*Tunnel, chan struct{}) {
 		close(tun.done)
 	}()
 	go func() {
-		tun.watchPod(cs)
+		tun.watchPod(context.Background(), cs)
 		close(watcherDone)
 	}()
 	return tun, watcherDone
@@ -135,11 +135,32 @@ func TestWatchPodDoesNotReportOurOwnTeardown(t *testing.T) {
 		stop: make(chan struct{}), done: make(chan struct{}), watchEvery: 10 * time.Millisecond,
 	}
 	tun.Close() // marks closing, stops the forwarder, deletes the pod
-	go tun.watchPod(cs)
+	go tun.watchPod(context.Background(), cs)
 	time.Sleep(50 * time.Millisecond)
 	tun.setForwardErr(nil)
 	close(tun.done)
 	if err := tun.Err(); err != nil {
 		t.Errorf("Err() = %v, want nil: the pod is gone because we deleted it", err)
+	}
+}
+
+// A cancelled caller context — Ctrl-C — stops the watcher without ending the
+// tunnel on its own: the command's teardown does that.
+func TestWatchPodStopsWithItsContext(t *testing.T) {
+	cs := fake.NewSimpleClientset(tunnelPod(corev1.PodRunning))
+	tun := &Tunnel{
+		PodName: testPodName, Namespace: testNamespace, clientset: cs,
+		stop: make(chan struct{}), done: make(chan struct{}), watchEvery: 10 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan struct{})
+	go func() {
+		tun.watchPod(ctx, cs)
+		close(returned)
+	}()
+	cancel()
+	waitClosed(t, returned, "the watcher returning after its context was cancelled")
+	if err := tun.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil: a cancelled caller is not an ended pod", err)
 	}
 }
